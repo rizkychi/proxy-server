@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "proxy-server"
-version = "0.7.0"
+version = "0.8.0"
 description = "Small dependency-free HTTP forward and reverse proxy server"
 readme = "README.md"
 license = { text = "MIT" }

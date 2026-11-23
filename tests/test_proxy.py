@@ -381,6 +381,30 @@ def test_config_dashboard():
     run(scenario_config_dashboard())
 
 
+async def scenario_pac():
+    proxy = Proxy(Config(port=8080, pac_hosts=("a.example.com", "*.b.example"),
+                         public_host="vps.example:8080"))
+    proxy_server = await asyncio.start_server(proxy.handle, "127.0.0.1", 0)
+    proxy_port = proxy_server.sockets[0].getsockname()[1]
+    r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
+    w.write(b"GET /proxy.pac HTTP/1.1\r\nHost: vps.example:8080\r\nConnection: close\r\n\r\n")
+    data = await r.read()
+    w.close()
+    assert b"application/x-ns-proxy-autoconfig" in data, data[:200]
+    assert b"FindProxyForURL" in data and b"PROXY vps.example:8080" in data
+    assert b'a.example.com' in data and b"dnsDomainIs" in data
+    assert b'"DIRECT"' in data, data
+    # no PAC_HOSTS -> falls back to routing everything via B
+    proxy2 = Proxy(Config(port=9999))
+    text = proxy2.pac_text("myhost:9999")
+    assert 'return "PROXY myhost:9999"' in text, text
+    proxy_server.close()
+
+
+def test_pac_file():
+    run(scenario_pac())
+
+
 def test_lgeb_reader_own_server():
     import hashlib
 

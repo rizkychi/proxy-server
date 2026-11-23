@@ -73,6 +73,8 @@ class Config:
     intercept: bool = False        # hold/release/drop, own hosts only
     intercept_allow_hosts: tuple = ()  # explicit env allowlist for intercept
     intercept_timeout: float = 30.0  # seconds a held item waits, then forwards
+    pac_hosts: tuple = ()          # hosts routed via this proxy in /proxy.pac
+    public_host: str = ""          # public DNS/IP of B, used in the PAC file
 
     def check_auth(self, headers: dict[str, str]) -> bool:
         if not self.auth:
@@ -437,6 +439,15 @@ class Proxy:
                 status = 200
                 return
 
+            if target.split("?")[0] in ("/proxy.pac", "/__pac"):
+                body = self.pac_text(headers.get("host", "")).encode()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\n"
+                             b"Content-Length: " + str(len(body)).encode() +
+                             b"\r\nConnection: close\r\n\r\n" + body)
+                await writer.drain()
+                status = 200
+                return
+
             if target.split("?")[0] in ("/__config", "/config"):
                 from urllib.parse import parse_qs
                 if method.upper() == "POST":
@@ -610,6 +621,37 @@ class Proxy:
         return bool(self.cfg.intercept_allow_hosts
                     and host_matches(host, self.cfg.intercept_allow_hosts))
 
+    def pac_text(self, request_host: str = "") -> str:
+        """PAC file for phones: route PAC_HOSTS via B, everything else DIRECT.
+
+        The proxy address advertised is PROXY_PUBLIC_HOST when set,
+        otherwise the Host the client used to fetch this file.
+        """
+        advertised = self.cfg.public_host or request_host or \
+            f"{self.cfg.host}:{self.cfg.port}"
+        if ":" not in advertised:
+            advertised = f"{advertised}:{self.cfg.port}"
+        hosts = self.cfg.pac_hosts or self.cfg.payload_allow_hosts or \
+            self.cfg.intercept_allow_hosts
+        rules = []
+        for pat in hosts:
+            p = pat.lower()
+            if p.startswith("*."):
+                rules.append(
+                    f'  if (dnsDomainIs(host, "{p[1:]}") || host == "{p[2:]}")'
+                    f' return "PROXY {advertised}";')
+            else:
+                rules.append(
+                    f'  if (host == "{p.split(":")[0]}")'
+                    f' return "PROXY {advertised}";')
+        body = "\n".join(rules) if rules else \
+            f'  return "PROXY {advertised}";  // no PAC_HOSTS: route all via B'
+        return ("function FindProxyForURL(url, host) {\n"
+                "  host = host.toLowerCase();\n"
+                f"{body}\n"
+                '  return "DIRECT";\n'
+                "}\n")
+
     def config_snapshot(self) -> dict:
         """Effective config for the dashboard. Secrets are never returned:
         only whether each one is set."""
@@ -626,6 +668,8 @@ class Proxy:
             "PROXY_CACHE_TTL": c.cache_ttl,
             "PROXY_RATE_LIMIT": c.rate_limit,
             "PROXY_LOG_FORMAT": c.log_format,
+            "PAC_HOSTS": ",".join(c.pac_hosts),
+            "PROXY_PUBLIC_HOST": c.public_host,
             "secrets_set": {
                 "PAYLOAD_LGEB_SALT_HEX": bool(c.payload_lgeb_salt_hex),
                 "PAYLOAD_AES_KEY": bool(c.payload_aes_key),
@@ -699,6 +743,8 @@ class Proxy:
         set_num("PROXY_CACHE_TTL", "cache_ttl", float)
         set_num("PROXY_RATE_LIMIT", "rate_limit", int)
         set_str("PROXY_LOG_FORMAT", "log_format")
+        set_csv("PAC_HOSTS", "pac_hosts")
+        set_str("PROXY_PUBLIC_HOST", "public_host")
         set_secret("PAYLOAD_LGEB_SALT_HEX", "payload_lgeb_salt_hex")
         set_secret("PAYLOAD_AES_KEY", "payload_aes_key")
         set_secret("PAYLOAD_AES_IV", "payload_aes_iv")
@@ -1012,7 +1058,8 @@ async function tick(){
 }
 const SET_BOOL = ['PAYLOAD_CAPTURE','PAYLOAD_LGEB','INTERCEPT'];
 const SET_TEXT = ['PAYLOAD_ALLOW_HOSTS','PAYLOAD_MAX_BYTES','PAYLOAD_LGEB_CONTENT_HASH',
-  'INTERCEPT_ALLOW_HOSTS','INTERCEPT_TIMEOUT','PROXY_CACHE_TTL','PROXY_RATE_LIMIT','PROXY_LOG_FORMAT'];
+  'INTERCEPT_ALLOW_HOSTS','INTERCEPT_TIMEOUT','PROXY_CACHE_TTL','PROXY_RATE_LIMIT','PROXY_LOG_FORMAT',
+  'PAC_HOSTS','PROXY_PUBLIC_HOST'];
 const SET_SECRET = ['PAYLOAD_LGEB_SALT_HEX','PAYLOAD_AES_KEY','PAYLOAD_AES_IV'];
 async function loadSettings(){
   try {
@@ -1160,6 +1207,10 @@ def config_from_env_and_args(argv=None) -> Config:
         intercept_allow_hosts=_csv(os.getenv("INTERCEPT_ALLOW_HOSTS", ""))
         or tuple(file_cfg.get("intercept_allow_hosts", [])),
         intercept_timeout=float(os.getenv("INTERCEPT_TIMEOUT", "30")),
+        pac_hosts=_csv(os.getenv("PAC_HOSTS", ""))
+        or tuple(file_cfg.get("pac_hosts", [])),
+        public_host=os.getenv("PROXY_PUBLIC_HOST", "")
+        or file_cfg.get("public_host", ""),
     )
 
 

@@ -184,6 +184,28 @@ and `POST /__config` (apply). Behaviour:
   `PROXY_UPSTREAM`) cannot move a listening socket, so they are saved
   to `.env` and reported as restart-required.
 
+#### Phone clients on a public VPS (0.8.0)
+
+B is an HTTP proxy, not a DNS server and not a VPN, so a phone connects
+like this:
+
+- **Wi-Fi, simplest:** in the Wi-Fi network's proxy settings choose
+  *Manual* and enter B's public DNS/IP + port — or choose *Auto* and
+  enter the PAC URL below.
+- **PAC (recommended):** `GET /proxy.pac` returns a Proxy Auto-Config
+  file. Hosts in `PAC_HOSTS` are routed `PROXY <PROXY_PUBLIC_HOST>`,
+  everything else goes `DIRECT`, so only traffic for your server A
+  passes through B. If `PAC_HOSTS` is empty it falls back to
+  `PAYLOAD_ALLOW_HOSTS` / `INTERCEPT_ALLOW_HOSTS`; if those are empty
+  too, everything is routed via B.
+- **Mobile data / all apps, all networks:** Wi-Fi proxy settings do not
+  apply. Use a VPN — either a VPN app on the phone that forwards to an
+  HTTP proxy, or a tunnel (e.g. WireGuard) to the VPS with the proxy
+  settings applied inside it. A custom *DNS* setting alone cannot do
+  this: DNS only resolves names, it never forwards traffic.
+- **If the port is public, set `PROXY_AUTH`** — an unauthenticated open
+  proxy on the internet will be found and abused by strangers.
+
 Guards, by design:
 
 - Capture is **off by default** and only ever runs for hosts explicitly
