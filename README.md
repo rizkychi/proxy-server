@@ -216,6 +216,41 @@ Guards, by design:
   your own DNS/IP), not Bilibili's live endpoints.
 - Keys/IVs are read from the environment only, never logged or stored.
 
+#### HTTPS MITM + dashboard rebuild (0.9.0)
+
+CONNECT tunnels are normally blind: B sees the host and byte counts,
+never the content. With MITM on, B **terminates TLS** for hosts in
+`MITM_ALLOW_HOSTS` (your own servers only — the same hard-disable for
+Bilibili domains applies here too):
+
+- B generates a local CA once into `MITM_CA_DIR` (default `.proxy-ca/`,
+  git-ignored; the private key is stored `0600` and never served).
+- Download the CA certificate from the dashboard's **HTTPS (MITM)**
+  panel or `GET /__ca`, and install it as a trusted CA on your phone
+  (Android: Settings → Security → Install a certificate → CA
+  certificate; iPhone: install the profile, then enable full trust in
+  Certificate Trust Settings). The panel shows the CA's SHA-256
+  fingerprint so you can compare it on the phone.
+- For each allowlisted host, B mints a leaf certificate from that CA,
+  decrypts the phone ↔ B leg, and opens a second TLS leg to A using
+  A's real certificate (`MITM_VERIFY_UPSTREAM=0` only if A is
+  self-signed). Decrypted requests then flow through the normal path:
+  payload capture, the LGEB reader, and intercept all work on HTTPS
+  exactly as on plain HTTP.
+- Apps with certificate pinning will still refuse the leaf cert; that
+  can only be changed in the app itself.
+- Requires `pip install cryptography`. Without it, MITM stays off and
+  the dashboard panel says so.
+- Toggle it live from the dashboard Settings (group "HTTPS (MITM)").
+
+The dashboard was also rebuilt for readability: Indonesian labels with
+a one-line explanation under every setting, formatted sizes/durations
+(KB, ms, uptime), status pills, a search box + quick filters (Semua /
+Dipantau / Error saja / CONNECT) for recent traffic, keyboard-operable
+rows (Enter opens detail, Esc closes), an offline banner when the
+server stops answering, a copyable PAC URL, and plain-language panels
+for intercept ("Ditahan"), the watchlist, and MITM setup.
+
 ### Connection detail (0.3.1)
 
 Click any row in **Recent traffic** to open its detail panel: connection id,

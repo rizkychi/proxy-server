@@ -130,7 +130,7 @@ async def scenario_dashboard():
 
     # dashboard page
     data = await raw(b"GET /__dashboard HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-    assert b"proxy-server dashboard" in data and b"Lumi" in data, data[:200]
+    assert b"Dashboard proxy-server" in data and b"--lumi" in data, data[:200]
 
     # stats: recent + watch structure
     data = await raw(b"GET /__stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -171,7 +171,7 @@ async def scenario_detail():
     r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
     w.write(b"GET /__dashboard HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     data = await r.read()
-    assert b"showDetail" in data and b"Connection detail" in data
+    assert b"showDetail" in data and b"Detail koneksi" in data
     w.close()
     proxy_server.close()
     origin_server.close()
@@ -448,3 +448,126 @@ def test_lgeb_reader_own_server():
     # wrong salt -> must not yield the plaintext
     bad = try_lgeb_decrypt(blob, "ff" * 16, h)
     assert not bad or bad.get("preview") != plain.decode()
+
+
+async def scenario_mitm(tmp: str):
+    import ssl as _ssl
+
+    from proxy_server.server import MitmCA
+
+    # --- TLS origin with a self-signed cert for 127.0.0.1 ---
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    import datetime as _dt
+    import ipaddress
+
+    okey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ocert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+             .public_key(okey.public_key())
+             .serial_number(x509.random_serial_number())
+             .not_valid_before(now - _dt.timedelta(days=1))
+             .not_valid_after(now + _dt.timedelta(days=30))
+             .add_extension(x509.SubjectAlternativeName(
+                 [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+                 critical=False)
+             .sign(okey, hashes.SHA256()))
+    origin_pem = str(Path(tmp) / "origin.pem")
+    with open(origin_pem, "wb") as fh:
+        fh.write(okey.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+        fh.write(ocert.public_bytes(serialization.Encoding.PEM))
+    octx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+    octx.load_cert_chain(origin_pem)
+
+    async def tls_origin(reader, writer):
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+        except Exception:
+            writer.close()
+            return
+        body = b"hello-over-tls"
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                     b"Content-Length: " + str(len(body)).encode() +
+                     b"\r\nConnection: close\r\n\r\n" + body)
+        await writer.drain()
+        writer.close()
+
+    origin_server = await asyncio.start_server(tls_origin, "127.0.0.1", 0,
+                                               ssl=octx)
+    origin_port = origin_server.sockets[0].getsockname()[1]
+
+    cfg = Config(mitm=True, mitm_allow_hosts=("127.0.0.1",),
+                 mitm_ca_dir=str(Path(tmp) / "ca"),
+                 mitm_verify_upstream=False,
+                 payload_capture=True, payload_allow_hosts=("127.0.0.1",))
+    proxy = Proxy(cfg)
+    proxy_server = await asyncio.start_server(proxy.handle, "127.0.0.1", 0)
+    proxy_port = proxy_server.sockets[0].getsockname()[1]
+
+    # guard: forbidden suffixes never MITM, even with a wildcard allowlist
+    guard = Proxy(Config(mitm=True, mitm_allow_hosts=("*",),
+                         mitm_ca_dir=str(Path(tmp) / "ca2")))
+    assert not guard._mitm_enabled_for("lumigo-cn-prod-vs.bilibiligame.net")
+    assert not guard._mitm_enabled_for("api.bilibili.com")
+    # allowlist is respected
+    assert not proxy._mitm_enabled_for("example.com:443")
+    assert proxy._mitm_enabled_for(f"127.0.0.1:{origin_port}")
+
+    # CA download endpoint serves a PEM the client can trust
+    r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
+    w.write(b"GET /__ca HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    data = await r.read()
+    w.close()
+    assert b"200 OK" in data and b"BEGIN CERTIFICATE" in data, data[:200]
+    ca_pem = str(Path(tmp) / "ca.crt")
+    Path(ca_pem).write_bytes(
+        data.partition(b"\r\n\r\n")[2])
+
+    # HTTPS through the proxy, trusting B's CA -> decrypted at B
+    r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
+    w.write(f"CONNECT 127.0.0.1:{origin_port} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{origin_port}\r\n\r\n".encode())
+    head = await r.readuntil(b"\r\n\r\n")
+    assert b"200" in head, head
+    loop = asyncio.get_running_loop()
+    cctx = _ssl.create_default_context(cafile=ca_pem)
+    new_reader = asyncio.StreamReader(limit=1024 * 1024)
+    protocol = asyncio.StreamReaderProtocol(new_reader)
+    new_transport = await loop.start_tls(w.transport, protocol, cctx,
+                                         server_hostname="127.0.0.1")
+    tw = asyncio.StreamWriter(new_transport, protocol, new_reader, loop)
+    tw.write(b"GET /echo HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+             b"Connection: close\r\n\r\n")
+    await tw.drain()
+    resp = await new_reader.read()
+    assert b"hello-over-tls" in resp, resp[:200]
+    tw.close()
+    w.close()
+
+    # the decrypted response body was captured for the dashboard
+    snap = proxy.stats.snapshot()
+    events = [e for e in snap["recent"] if e.get("payload")]
+    assert events, snap["recent"]
+    previews = [e["payload"].get("response", {}).get("preview", "")
+                for e in events]
+    assert any("hello-over-tls" in p for p in previews), previews
+
+    assert MitmCA.available()
+    proxy_server.close()
+    origin_server.close()
+
+
+def test_mitm_https_own_host():
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        return  # MITM path is exercised in the venv run
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        run(scenario_mitm(tmp))

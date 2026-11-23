@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.proxy-ca/
 *.egg-info/
 dist/
 build/

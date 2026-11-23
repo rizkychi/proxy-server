@@ -1,9 +1,14 @@
-"""Async HTTP forward proxy + reverse proxy. Standard library only.
+"""Async HTTP forward proxy + reverse proxy.
 
 Forward mode:
   - Plain HTTP requests are forwarded to the origin and relayed back.
   - CONNECT establishes a raw TCP tunnel (TLS passes through encrypted,
-    the proxy never sees the plaintext).
+    the proxy never sees the plaintext) — unless MITM is enabled for
+    that host (MITM_ALLOW_HOSTS, the operator's own servers only), in
+    which case the proxy terminates TLS with a local CA so the
+    decrypted traffic can be captured / intercepted like plain HTTP.
+    MITM needs the third-party `cryptography` package; everything
+    else is standard library only.
 
 Reverse mode:
   - Every request is forwarded to a single configured upstream.
@@ -21,6 +26,7 @@ import hashlib
 import json
 from collections import Counter, deque
 import os
+import ssl
 import sys
 import time
 from dataclasses import dataclass
@@ -75,6 +81,10 @@ class Config:
     intercept_timeout: float = 30.0  # seconds a held item waits, then forwards
     pac_hosts: tuple = ()          # hosts routed via this proxy in /proxy.pac
     public_host: str = ""          # public DNS/IP of B, used in the PAC file
+    mitm: bool = False             # HTTPS termination, own hosts only
+    mitm_allow_hosts: tuple = ()   # explicit allowlist for MITM
+    mitm_ca_dir: str = ".proxy-ca"  # local CA cert/key + per-host leaf certs
+    mitm_verify_upstream: bool = True  # verify A's real cert on the B->A leg
 
     def check_auth(self, headers: dict[str, str]) -> bool:
         if not self.auth:
@@ -259,6 +269,159 @@ def host_matches(host: str, patterns) -> bool:
     return False
 
 
+class MitmCA:
+    """A local certificate authority for HTTPS termination (MITM).
+
+    The CA is generated once into ``ca_dir`` (cert is downloadable from
+    the dashboard so the operator can install it on their own phone;
+    the key never leaves the server). Leaf certificates are minted per
+    host and cached on disk. Needs the `cryptography` package; without
+    it, ``ensure()`` returns False and MITM stays off.
+    """
+
+    def __init__(self, ca_dir: str):
+        self.dir = ca_dir
+        self.cert_path = os.path.join(ca_dir, "ca.crt.pem")
+        self.key_path = os.path.join(ca_dir, "ca.key.pem")
+        self._ready = False
+        self._ca_cert = None
+        self._ca_key = None
+        self._ctx_cache: dict[str, ssl.SSLContext] = {}
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            import cryptography  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def ensure(self) -> bool:
+        if self._ready:
+            return True
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.x509.oid import NameOID
+            import datetime as _dt
+        except ImportError:
+            return False
+        try:
+            os.makedirs(self.dir, mode=0o700, exist_ok=True)
+            if os.path.exists(self.cert_path) and \
+                    os.path.exists(self.key_path):
+                self._ca_cert = x509.load_pem_x509_certificate(
+                    open(self.cert_path, "rb").read())
+                self._ca_key = serialization.load_pem_private_key(
+                    open(self.key_path, "rb").read(), None)
+            else:
+                self._ca_key = rsa.generate_private_key(
+                    public_exponent=65537, key_size=2048)
+                name = x509.Name([x509.NameAttribute(
+                    NameOID.COMMON_NAME, "proxy-server local CA")])
+                now = _dt.datetime.now(_dt.timezone.utc)
+                self._ca_cert = (
+                    x509.CertificateBuilder()
+                    .subject_name(name).issuer_name(name)
+                    .public_key(self._ca_key.public_key())
+                    .serial_number(x509.random_serial_number())
+                    .not_valid_before(now - _dt.timedelta(days=1))
+                    .not_valid_after(now + _dt.timedelta(days=3650))
+                    .add_extension(x509.BasicConstraints(
+                        ca=True, path_length=0), critical=True)
+                    .add_extension(x509.KeyUsage(
+                        digital_signature=False, content_commitment=False,
+                        key_encipherment=False, data_encipherment=False,
+                        key_agreement=False, key_cert_sign=True,
+                        crl_sign=True, encipher_only=False,
+                        decipher_only=False), critical=True)
+                    .sign(self._ca_key, hashes.SHA256()))
+                self._write_private(self.key_path, self._ca_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption()))
+                with open(self.cert_path, "wb") as fh:
+                    fh.write(self._ca_cert.public_bytes(
+                        serialization.Encoding.PEM))
+            self._ready = True
+            return True
+        except Exception as exc:
+            print(f"mitm CA setup failed: {exc!r}", file=sys.stderr)
+            return False
+
+    @staticmethod
+    def _write_private(path: str, data: bytes) -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+
+    def ca_pem(self) -> bytes:
+        with open(self.cert_path, "rb") as fh:
+            return fh.read()
+
+    def fingerprint(self) -> str:
+        if not self._ready:
+            return ""
+        from cryptography.hazmat.primitives import hashes
+        fp = self._ca_cert.fingerprint(hashes.SHA256()).hex()
+        return ":".join(fp[i:i + 2] for i in range(0, len(fp), 2))
+
+    def server_context(self, host: str) -> ssl.SSLContext:
+        """TLS server context presenting a leaf cert for ``host``."""
+        if host in self._ctx_cache:
+            return self._ctx_cache[host]
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+        import datetime as _dt
+        import ipaddress
+        hosts_dir = os.path.join(self.dir, "hosts")
+        os.makedirs(hosts_dir, mode=0o700, exist_ok=True)
+        safe = "".join(ch if ch.isalnum() or ch in ".-" else "_"
+                       for ch in host)
+        leaf_path = os.path.join(hosts_dir, safe + ".pem")
+        if not os.path.exists(leaf_path):
+            key = rsa.generate_private_key(public_exponent=65537,
+                                           key_size=2048)
+            try:
+                san = x509.IPAddress(ipaddress.ip_address(host))
+            except ValueError:
+                san = x509.DNSName(host)
+            now = _dt.datetime.now(_dt.timezone.utc)
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(x509.Name([x509.NameAttribute(
+                    NameOID.COMMON_NAME, host)]))
+                .issuer_name(self._ca_cert.subject)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - _dt.timedelta(days=1))
+                .not_valid_after(now + _dt.timedelta(days=397))
+                .add_extension(x509.SubjectAlternativeName([san]),
+                               critical=False)
+                .add_extension(x509.ExtendedKeyUsage(
+                    [ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+                .add_extension(x509.KeyUsage(
+                    digital_signature=True, content_commitment=False,
+                    key_encipherment=True, data_encipherment=False,
+                    key_agreement=False, key_cert_sign=False,
+                    crl_sign=False, encipher_only=False,
+                    decipher_only=False), critical=True)
+                .sign(self._ca_key, hashes.SHA256()))
+            blob = key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()) + cert.public_bytes(
+                    serialization.Encoding.PEM)
+            self._write_private(leaf_path, blob)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(leaf_path)
+        self._ctx_cache[host] = ctx
+        return ctx
+
+
 class Stats:
     def __init__(self):
         self.started = time.time()
@@ -403,6 +566,9 @@ def update_env_file(path: str, updates: dict[str, str]) -> None:
 class Proxy:
     def __init__(self, config: Config):
         self.cfg = config
+        self.ca = MitmCA(config.mitm_ca_dir)
+        self._ca_ready = False
+        self._ca_failed = False
         self.intercepts: dict[int, dict] = {}
         self._intercept_seq = 0
         self.stats = Stats()
@@ -513,6 +679,30 @@ class Proxy:
                 status = 200
                 return
 
+            if target.split("?")[0] in ("/__ca", "/__ca.crt", "/ca.crt"):
+                if self._maybe_ca():
+                    body = self.ca.ca_pem()
+                    writer.write(b"HTTP/1.1 200 OK\r\n"
+                                 b"Content-Type: application/x-x509-ca-cert\r\n"
+                                 b"Content-Disposition: attachment; "
+                                 b"filename=\"proxy-server-ca.crt\"\r\n"
+                                 b"Content-Length: " +
+                                 str(len(body)).encode() +
+                                 b"\r\nConnection: close\r\n\r\n" + body)
+                    status = 200
+                else:
+                    body = json.dumps(
+                        {"error": "MITM CA unavailable: enable MITM and "
+                                  "install the cryptography package"}).encode()
+                    writer.write(b"HTTP/1.1 404 Not Found\r\n"
+                                 b"Content-Type: application/json\r\n"
+                                 b"Content-Length: " +
+                                 str(len(body)).encode() +
+                                 b"\r\nConnection: close\r\n\r\n" + body)
+                    status = 404
+                await writer.drain()
+                return
+
             if target in ("/__health", "/health"):
                 body = b'{"status":"ok"}'
                 writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -556,7 +746,11 @@ class Proxy:
 
             if method.upper() == "CONNECT":
                 host = target
-                status = await self._tunnel(reader, writer, target, sent)
+                if self._mitm_enabled_for(target):
+                    status = await self._mitm(reader, writer, target,
+                                              sent, detail)
+                else:
+                    status = await self._tunnel(reader, writer, target, sent)
             elif self.cfg.mode == "reverse":
                 host = self.cfg.upstream
                 status = await self._forward(reader, writer, first, headers,
@@ -612,6 +806,125 @@ class Proxy:
             pipe(up_reader, writer, received),
         )
         return 200
+
+    def _maybe_ca(self) -> bool:
+        """Lazily set up the MITM CA once; remember failures until the
+        config changes so a missing `cryptography` install is not
+        retried on every connection."""
+        if self._ca_ready:
+            return True
+        if self._ca_failed:
+            return False
+        self._ca_ready = self.ca.ensure()
+        if not self._ca_ready:
+            self._ca_failed = True
+        return self._ca_ready
+
+    def _mitm_enabled_for(self, host: str) -> bool:
+        if not self.cfg.mitm:
+            return False
+        if payload_forbidden(host):
+            return False
+        if not (self.cfg.mitm_allow_hosts
+                and host_matches(host, self.cfg.mitm_allow_hosts)):
+            return False
+        return self._maybe_ca()
+
+    async def _mitm(self, reader, writer, target: str, sent: list[int],
+                    detail: dict) -> int:
+        """Terminate TLS for one allowlisted host, then treat the
+        decrypted stream as plain HTTP (capture / intercept apply).
+
+        Two TLS legs: phone <-> B uses a leaf cert from B's local CA
+        (the phone must trust that CA), B <-> A uses A's real cert.
+        Requests are forwarded one at a time over a fresh upstream
+        connection; the client leg stays open while responses are
+        length- or chunk-framed.
+        """
+        host, _, port_s = target.partition(":")
+        port = int(port_s or 443)
+        if self.cfg.mitm_verify_upstream:
+            up_ctx = ssl.create_default_context()
+        else:
+            up_ctx = ssl._create_unverified_context()
+
+        async def open_upstream():
+            return await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=up_ctx,
+                                        server_hostname=host),
+                self.cfg.timeout)
+
+        try:
+            up_reader, up_writer = await open_upstream()
+        except Exception:
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n"
+                         b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return 502
+
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+
+        loop = asyncio.get_running_loop()
+        new_reader = asyncio.StreamReader(limit=BUFFER * 4)
+        protocol = asyncio.StreamReaderProtocol(new_reader)
+        try:
+            new_transport = await asyncio.wait_for(
+                loop.start_tls(writer.transport, protocol,
+                               self.ca.server_context(host),
+                               server_side=True),
+                self.cfg.timeout)
+        except Exception as exc:
+            print(f"mitm client TLS failed for {host}: {exc!r}",
+                  file=sys.stderr)
+            try:
+                up_writer.close()
+            except Exception:
+                pass
+            return 502
+        tls_writer = asyncio.StreamWriter(new_transport, protocol,
+                                          new_reader, loop)
+
+        status = 200
+        try:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(
+                        read_head(new_reader), self.cfg.timeout)
+                except Exception:
+                    break
+                if raw is None:
+                    break
+                first, headers, rest = parse_head(raw)
+                parts = first.split(" ")
+                if len(parts) < 2:
+                    break
+                path = parts[1]
+                abs_target = path if path.startswith("http") else \
+                    f"https://{host}:{port}" + \
+                    (path if path.startswith("/") else "/" + path)
+                req_detail: dict = {}
+                status = await self._forward(
+                    new_reader, tls_writer, first, headers, rest, None,
+                    abs_target, sent, req_detail,
+                    up_streams=(up_reader, up_writer),
+                    close_client=False, default_port=443)
+                if req_detail.get("payload"):
+                    detail["payload"] = req_detail["payload"]
+                if req_detail.get("response_framing") == "close" or \
+                        status in (400, 502):
+                    break
+                try:
+                    up_reader, up_writer = await open_upstream()
+                except Exception:
+                    break
+        finally:
+            for w in (tls_writer, up_writer):
+                try:
+                    w.close()
+                except Exception:
+                    pass
+        return status
 
     def _intercept_enabled_for(self, host: str) -> bool:
         if not self.cfg.intercept:
@@ -670,6 +983,16 @@ class Proxy:
             "PROXY_LOG_FORMAT": c.log_format,
             "PAC_HOSTS": ",".join(c.pac_hosts),
             "PROXY_PUBLIC_HOST": c.public_host,
+            "MITM": c.mitm,
+            "MITM_ALLOW_HOSTS": ",".join(c.mitm_allow_hosts),
+            "mitm_ca": {
+                "ready": bool(self._ca_ready),
+                "crypto_available": MitmCA.available(),
+                "fingerprint": self.ca.fingerprint()
+                if self._ca_ready else "",
+                "download": "/__ca",
+                "verify_upstream": c.mitm_verify_upstream,
+            },
             "secrets_set": {
                 "PAYLOAD_LGEB_SALT_HEX": bool(c.payload_lgeb_salt_hex),
                 "PAYLOAD_AES_KEY": bool(c.payload_aes_key),
@@ -745,6 +1068,10 @@ class Proxy:
         set_str("PROXY_LOG_FORMAT", "log_format")
         set_csv("PAC_HOSTS", "pac_hosts")
         set_str("PROXY_PUBLIC_HOST", "public_host")
+        if take("MITM") is not None:
+            self._ca_failed = False  # retry CA setup after a toggle
+        set_bool("MITM", "mitm")
+        set_csv("MITM_ALLOW_HOSTS", "mitm_allow_hosts")
         set_secret("PAYLOAD_LGEB_SALT_HEX", "payload_lgeb_salt_hex")
         set_secret("PAYLOAD_AES_KEY", "payload_aes_key")
         set_secret("PAYLOAD_AES_IV", "payload_aes_iv")
@@ -817,7 +1144,9 @@ class Proxy:
                     and host_matches(host, self.cfg.payload_allow_hosts))
 
     async def _forward(self, reader, writer, first, headers, rest,
-                       upstream_base, target, sent, detail=None) -> int:
+                       upstream_base, target, sent, detail=None,
+                       up_streams=None, close_client=True,
+                       default_port=80) -> int:
         if upstream_base:
             base = urlsplit(upstream_base)
             host, port = base.hostname, base.port or 80
@@ -829,7 +1158,7 @@ class Proxy:
                 writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
                 await writer.drain()
                 return 400
-            host, port = u.hostname, u.port or 80
+            host, port = u.hostname, u.port or default_port
             path = u.path or "/"
             if u.query:
                 path += "?" + u.query
@@ -876,8 +1205,11 @@ class Proxy:
             if self.cfg.cache_ttl:
                 self.stats.cache_misses += 1
 
-        up_reader, up_writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), self.cfg.timeout)
+        if up_streams is not None:
+            up_reader, up_writer = up_streams
+        else:
+            up_reader, up_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), self.cfg.timeout)
 
         raw_headers = []
         seen_host = False
@@ -921,13 +1253,20 @@ class Proxy:
         except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            if not intercept:
+            if not intercept and close_client:
                 try:
                     writer.close()
                 except Exception:
                     pass
 
         response = b"".join(chunks)
+        if detail is not None:
+            resp_head = response.partition(b"\r\n\r\n")[0].lower()
+            if b"content-length:" in resp_head or \
+                    b"transfer-encoding: chunked" in resp_head:
+                detail["response_framing"] = "length"
+            else:
+                detail["response_framing"] = "close"
 
         # Intercept (receive): hold the response before it reaches the client.
         if intercept:
@@ -983,137 +1322,550 @@ class Proxy:
         return status
 
 DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>proxy-server dashboard</title>
+<title>Dashboard proxy-server</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:24px;background:#0f1115;color:#e6e6e6}
-h1{font-size:20px} h2{font-size:15px;margin-top:28px;color:#9fd}
-.cards{display:flex;gap:12px;flex-wrap:wrap}
-.card{background:#1a1d24;border:1px solid #2a2e38;border-radius:10px;padding:14px 18px;min-width:120px}
-.card b{font-size:22px;display:block}
-table{border-collapse:collapse;width:100%;margin-top:8px}
-td,th{border-bottom:1px solid #2a2e38;padding:6px 8px;text-align:left;font-size:13px}
-.watch{color:#ffd479} .muted{color:#8a90a0} .err{color:#ff7b7b}
+:root{--bg:#101318;--panel:#171b22;--panel2:#1e232c;--line:#2b313b;
+--text:#eceef3;--muted:#a9b1bf;--accent:#f0b64a;--ok:#4cc38a;
+--err:#f2707a;--info:#6cb2f5;--radius:8px}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+margin:0;background:var(--bg);color:var(--text);line-height:1.45}
+header,main,footer{max-width:1180px;margin:0 auto;padding:0 24px}
+header{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;
+align-items:flex-start;padding-top:22px}
+h1{font-size:21px;margin:0}
+h1 .sub{color:var(--muted);font-weight:500;font-size:15px}
+h2{font-size:16px;margin:28px 0 10px}
+.intro{margin:6px 0 0;max-width:64ch;color:var(--muted)}
+.muted{color:var(--muted)} .small{font-size:12.5px}
+.headctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px}
+.card{background:var(--panel);border:1px solid var(--line);
+border-radius:var(--radius);padding:12px 14px}
+.card b{font-size:21px;display:block;font-variant-numeric:tabular-nums}
+.panel{background:var(--panel);border:1px solid var(--line);
+border-radius:var(--radius);padding:14px 16px;margin-top:10px}
+table{border-collapse:collapse;width:100%}
+td,th{border-bottom:1px solid var(--line);padding:7px 8px;text-align:left;
+font-size:13px;vertical-align:top}
+th{color:var(--muted);font-weight:600}
+.tscroll{overflow-x:auto}
+tbody tr[data-i]{cursor:pointer}
+tbody tr[data-i]:hover{background:var(--panel2)}
+button,.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);
+border-radius:var(--radius);padding:7px 12px;font-size:13.5px;cursor:pointer;
+text-decoration:none;display:inline-block}
+button:hover,.btn:hover{border-color:var(--muted)}
+button.primary{background:var(--accent);border-color:var(--accent);
+color:#1a1305;font-weight:600}
+button.danger:hover{border-color:var(--err);color:var(--err)}
+.chip.on{background:var(--accent);border-color:var(--accent);
+color:#1a1305;font-weight:600}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;
+border:1px solid var(--line);font-variant-numeric:tabular-nums;white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.pill.err{color:var(--err);border-color:var(--err)}
+.pill.warn{color:var(--accent);border-color:var(--accent)}
+.pill.info{color:var(--info);border-color:var(--info)}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}
+.toolbar input[type=search]{flex:1;min-width:200px}
+input[type=text],input[type=password],input[type=search]{
+background:var(--bg);color:var(--text);border:1px solid var(--line);
+border-radius:var(--radius);padding:7px 10px;font-size:13.5px}
+input[readonly]{width:100%}
+.field{margin:12px 0}
+.field label{display:block;font-weight:600;font-size:13.5px;margin-bottom:3px}
+.field .help{color:var(--muted);font-size:12.5px}
+.field input[type=text],.field input[type=password]{width:min(520px,100%)}
+.check{display:flex;gap:9px;align-items:flex-start;cursor:pointer}
+.check input{margin-top:2px;width:16px;height:16px;flex:none}
+.check .help{display:block}
+fieldset{border:1px solid var(--line);border-radius:var(--radius);
+padding:6px 16px 14px;margin:14px 0}
+legend{font-weight:700;padding:0 6px}
+.errbar{background:#2b171a;border:1px solid var(--err);color:#ffd9dc;
+border-radius:var(--radius);padding:10px 14px;margin-top:14px}
+pre{background:var(--bg);border:1px solid var(--line);
+border-radius:var(--radius);padding:8px;white-space:pre-wrap;
+word-break:break-all;font-size:12px;max-height:260px;overflow:auto;margin:4px 0}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;
+word-break:break-all}
+ol.steps{margin:8px 0;padding-left:20px}
+ol.steps li{margin:5px 0}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 28px}
+@media(max-width:840px){.grid2{grid-template-columns:1fr}}
+.watchname{color:var(--accent)}
+.sr{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+footer{padding-bottom:28px;color:var(--muted);font-size:12.5px}
+footer a{color:var(--info)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important}}
 </style></head><body>
-<h1>proxy-server dashboard <span class="muted">— metadata only (host · status · bytes · duration)</span></h1>
-<div class="cards" id="cards"></div>
-<h2>Lumi / watchlist traffic</h2>
-<div id="watch" class="muted">no watchlist configured — start with <code>--lumi</code> or <code>--watch HOST</code></div>
-<table id="watchTable"></table>
-<h2>Settings — edit env from here</h2>
-<div class="card" style="display:block">
-<div id="settingsForm">loading settings…</div>
-<label><input type="checkbox" id="setPersist" checked> also save to .env (applies on next start too)</label>
-<button onclick="saveSettings()">Save settings</button>
-<span id="settingsMsg" class="muted"></span>
-</div>
-<h2>Intercept — held traffic (own hosts only)</h2>
-<div id="intercepts" class="muted">intercept off — set <code>INTERCEPT=1</code> + <code>INTERCEPT_ALLOW_HOSTS</code> in env</div>
-<h2>Connection detail</h2>
-<div id="detail" class="card" style="display:block">Click a row in Recent traffic to see its detail. Payload is shown only for your own hosts listed in PAYLOAD_ALLOW_HOSTS.</div>
-<h2>Recent traffic through the proxy</h2>
-<table id="recent"><tr><th>time</th><th>method</th><th>host</th><th>status</th><th>bytes</th><th>ms</th><th></th></tr></table>
-<h2>Top hosts</h2>
-<table id="tops"></table>
+<header>
+  <div>
+    <h1>proxy-server <span class="sub">— dashboard operator</span></h1>
+    <p class="intro">Pantau lalu lintas yang lewat proxy ini. Klik baris
+    koneksi untuk detailnya. Payload hanya tampil untuk host milikmu yang
+    ada di daftar capture; koneksi lain hanya metadata (host, status,
+    ukuran, durasi).</p>
+  </div>
+  <div class="headctl">
+    <span id="livePill" class="pill ok">Live — menyegarkan tiap 2 detik</span>
+    <label class="check"><input type="checkbox" id="autoRefresh" checked>
+    <span>Segarkan otomatis</span></label>
+    <button type="button" id="btnRefresh">Segarkan sekarang</button>
+  </div>
+</header>
+<main>
+  <div id="errbar" class="errbar" hidden>Tidak bisa menghubungi server —
+  menampilkan data terakhir yang berhasil dimuat. Akan dicoba lagi
+  otomatis.</div>
+
+  <section aria-labelledby="h-sum">
+    <h2 id="h-sum">Ringkasan</h2>
+    <div class="cards" id="cards"><p class="muted">Memuat data…</p></div>
+  </section>
+
+  <section aria-labelledby="h-traf">
+    <h2 id="h-traf">Lalu lintas terbaru</h2>
+    <div class="toolbar">
+      <label class="sr" for="q">Cari berdasarkan host, method, atau status</label>
+      <input id="q" type="search" placeholder="Cari host / method / status…">
+      <div role="group" aria-label="Filter cepat">
+        <button type="button" class="chip on" data-f="all">Semua</button>
+        <button type="button" class="chip" data-f="watched">Dipantau</button>
+        <button type="button" class="chip" data-f="errors">Error saja</button>
+        <button type="button" class="chip" data-f="connect">CONNECT</button>
+      </div>
+    </div>
+    <div id="detail" class="panel" hidden></div>
+    <div class="tscroll"><table id="recent">
+      <thead><tr><th>Waktu</th><th>Method</th><th>Host</th><th>Status</th>
+      <th>Ukuran</th><th>Durasi</th><th>Keterangan</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p id="recentEmpty" class="muted" hidden>Belum ada lalu lintas yang
+    cocok dengan filter ini. Arahkan HP ke proxy ini lalu buka sesuatu,
+    atau longgarkan filternya.</p>
+  </section>
+
+  <section aria-labelledby="h-hold">
+    <h2 id="h-hold">Ditahan — intercept</h2>
+    <p class="muted small">Request dan response untuk host di daftar
+    intercept berhenti di sini dulu. <b>Teruskan</b> = kirim seperti
+    biasa. <b>Tolak</b> = putuskan (request ditolak 403, response
+    digagalkan 502). Lewat batas timeout, yang ditahan diteruskan
+    otomatis.</p>
+    <div id="intercepts"><p class="muted">Tidak ada yang sedang ditahan.</p></div>
+  </section>
+
+  <section aria-labelledby="h-mitm">
+    <h2 id="h-mitm">HTTPS — baca trafik terenkripsi (MITM)</h2>
+    <div class="panel" id="mitmPanel"><p class="muted">Memuat status MITM…</p></div>
+  </section>
+
+  <div class="grid2">
+    <section aria-labelledby="h-pac">
+      <h2 id="h-pac">Sambungkan HP (PAC)</h2>
+      <div class="panel">
+        <label for="pacUrl"><b>URL PAC untuk Wi-Fi HP</b></label>
+        <p class="help muted small">Di pengaturan Wi-Fi HP pilih proxy
+        &ldquo;Auto&rdquo; lalu tempel URL ini. Hanya host di daftar PAC
+        yang lewat proxy ini; sisanya langsung.</p>
+        <input id="pacUrl" type="text" readonly value="">
+        <p><button type="button" id="btnCopyPac">Salin URL PAC</button>
+        <span id="pacMsg" class="muted small"></span></p>
+        <p class="muted small">Atau proxy &ldquo;Manual&rdquo;: host =
+        alamat proxy ini, port = port-nya. Manual mengarahkan semua
+        trafik HP lewat sini.</p>
+      </div>
+    </section>
+    <section aria-labelledby="h-watch">
+      <h2 id="h-watch">Host yang dipantau &amp; tersibuk</h2>
+      <div class="panel">
+        <div id="watch"><p class="muted">Tidak ada watchlist — jalankan
+        dengan <code>--lumi</code> atau <code>--watch HOST</code>.</p></div>
+        <table id="watchTable"></table>
+        <h3 class="small" style="margin:14px 0 4px">Host tersibuk</h3>
+        <table id="tops"></table>
+      </div>
+    </section>
+  </div>
+
+  <section aria-labelledby="h-set">
+    <h2 id="h-set">Pengaturan</h2>
+    <div class="panel">
+      <div id="settingsForm"><p class="muted">Memuat pengaturan…</p></div>
+      <label class="check" style="margin-top:12px">
+        <input type="checkbox" id="setPersist" checked>
+        <span>Simpan juga ke .env
+        <span class="help muted small" style="display:block">Kalau dicentang,
+        pilihan di sini tetap berlaku setelah server di-restart.</span></span>
+      </label>
+      <p><button type="button" class="primary" id="btnSave">Simpan pengaturan</button>
+      <span id="settingsMsg" class="muted" role="status"></span></p>
+    </div>
+  </section>
+</main>
+<footer>
+  proxy-server dashboard · data mentah:
+  <a href="/__stats">/__stats</a> · <a href="/__health">/__health</a> ·
+  sertifikat CA: <a href="/__ca">/__ca</a>
+</footer>
 <script>
-async function tick(){
-  const s = await (await fetch('/__stats')).json();
-  const c = [['Requests',s.requests],['Errors',s.errors],['Bytes sent',s.bytes_sent],
-    ['Cache hits',s.cache_hits],['Cache misses',s.cache_misses],
-    ['Rate limited',s.rate_limited],['Blocked',s.blocked],['Uptime (s)',s.uptime_seconds]];
-  document.getElementById('cards').innerHTML =
-    c.map(x=>`<div class="card"><span class="muted">${x[0]}</span><b>${x[1]}</b></div>`).join('');
-  const w = s.watch || {};
-  if ((w.patterns||[]).length){
-    document.getElementById('watch').innerHTML =
-      `<span class="watch">${w.total_requests} watched requests</span> · patterns: ${w.patterns.join(', ')}`;
-    document.getElementById('watchTable').innerHTML =
-      '<tr><th>host</th><th>requests (recent window)</th></tr>' +
-      (w.hosts||[]).map(h=>`<tr><td class="watch">${h[0]}</td><td>${h[1]}</td></tr>`).join('');
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function fmtBytes(n){ n = Number(n)||0;
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n/1024).toFixed(1).replace('.',',') + ' KB';
+  if (n < 1073741824) return (n/1048576).toFixed(1).replace('.',',') + ' MB';
+  return (n/1073741824).toFixed(2).replace('.',',') + ' GB'; }
+function fmtMs(ms){ ms = Number(ms)||0;
+  if (ms < 1000) return ms + ' ms';
+  return (ms/1000).toFixed(1).replace('.',',') + ' dtk'; }
+function fmtUptime(s){ s = Number(s)||0;
+  if (s < 60) return s + ' dtk';
+  if (s < 3600) return Math.floor(s/60) + ' mnt';
+  if (s < 86400) return Math.floor(s/3600) + ' jam ' +
+    Math.floor((s%3600)/60) + ' mnt';
+  return Math.floor(s/86400) + ' hari'; }
+function statusPill(st){ st = Number(st)||0;
+  const cls = st>=500 ? 'err' : (st>=400 ? 'warn' : 'ok');
+  return `<span class="pill ${cls}">${st===0 ? '—' : st}</span>`; }
+window._recent = []; window._shown = []; window._filter = 'all';
+
+function passesFilter(e){
+  const f = window._filter;
+  if (f === 'watched' && !e.watched) return false;
+  if (f === 'errors' && !(Number(e.status) >= 400)) return false;
+  if (f === 'connect' && String(e.method).toUpperCase() !== 'CONNECT')
+    return false;
+  const q = ($('q').value || '').trim().toLowerCase();
+  if (q){
+    const hay = (e.host + ' ' + e.method + ' ' + e.status + ' ' +
+      e.target).toLowerCase();
+    if (!hay.includes(q)) return false;
   }
-  window._recent = s.recent || [];
-  document.getElementById('recent').innerHTML =
-    '<tr><th>time</th><th>method</th><th>host</th><th>status</th><th>bytes</th><th>ms</th><th></th></tr>' +
-    window._recent.slice(0,50).map((e,i)=>
-      `<tr onclick="showDetail(${i})" style="cursor:pointer"><td>${e.time}</td><td>${e.method}</td><td class="${e.watched?'watch':''}">${e.host}</td>`+
-      `<td class="${e.status>=500?'err':''}">${e.status}</td><td>${e.bytes}</td><td>${e.duration_ms}</td>`+
-      `<td>${e.watched?'<span class="watch">● watched</span>':''}</td></tr>`).join('');
+  return true;
+}
+
+function renderRecent(){
+  const list = window._recent.slice(0,50).filter(passesFilter);
+  window._shown = list;
+  $('recent').querySelector('tbody').innerHTML = list.map((e,i)=>
+    `<tr data-i="${i}" tabindex="0">` +
+    `<td>${esc(e.time)}</td><td>${esc(e.method)}</td>` +
+    `<td class="${e.watched?'watchname':''}">${esc(e.host)}</td>` +
+    `<td>${statusPill(e.status)}</td><td>${fmtBytes(e.bytes)}</td>` +
+    `<td>${fmtMs(e.duration_ms)}</td>` +
+    `<td>${e.watched?'<span class="pill warn">dipantau</span>':''}` +
+    `${e.payload?' <span class="pill info">payload ada</span>':''}</td></tr>`
+  ).join('');
+  $('recentEmpty').hidden = list.length > 0;
+  $('recent').querySelectorAll('tbody tr[data-i]').forEach(tr=>{
+    tr.addEventListener('click', ()=>showDetail(Number(tr.dataset.i)));
+    tr.addEventListener('keydown', ev=>{
+      if (ev.key==='Enter' || ev.key===' '){
+        ev.preventDefault(); showDetail(Number(tr.dataset.i)); }});
+  });
+}
+
+function renderIntercepts(pend){
+  if (!pend.length){
+    $('intercepts').innerHTML =
+      '<p class="muted">Tidak ada yang sedang ditahan.</p>';
+    return;
+  }
+  $('intercepts').innerHTML = pend.map(p=>{
+    const phase = p.phase === 'request'
+      ? 'Request — dari klien ke server (keluar)'
+      : 'Response — dari server ke klien (masuk)';
+    return `<div class="panel"><b>#${p.id} · ${esc(phase)}</b><br>` +
+      `<span class="mono">${esc(p.method)} ${esc(p.host)}` +
+      `${esc(p.target)}</span>` +
+      (p.body ? `<pre>${esc(String(p.body.preview).slice(0,300))}</pre>` +
+        `<span class="muted small">${esc(p.body.kind)} · ` +
+        `${fmtBytes(p.body.size)}` +
+        `${p.body.truncated?' · terpotong di tampilan':''}</span>` : '') +
+      `<p><button type="button" class="primary" ` +
+      `onclick="resolveIntercept(${p.id},'release')">Teruskan</button> ` +
+      `<button type="button" class="danger" ` +
+      `onclick="resolveIntercept(${p.id},'drop')">Tolak</button></p></div>`;
+  }).join('');
+}
+
+async function tick(){
+  try {
+    const s = await (await fetch('/__stats')).json();
+    $('errbar').hidden = true;
+    $('livePill').className = 'pill ok';
+    $('livePill').textContent = 'Live — menyegarkan tiap 2 detik';
+    const c = [['Total request', s.requests], ['Error (5xx)', s.errors],
+      ['Data terkirim', fmtBytes(s.bytes_sent)],
+      ['Cache hit', s.cache_hits], ['Cache miss', s.cache_misses],
+      ['Dibatasi (rate limit)', s.rate_limited], ['Diblokir', s.blocked],
+      ['Server menyala sejak', fmtUptime(s.uptime_seconds)]];
+    $('cards').innerHTML = c.map(x=>
+      `<div class="card"><span class="muted small">${x[0]}</span>` +
+      `<b>${x[1]}</b></div>`).join('');
+    const w = s.watch || {};
+    if ((w.patterns||[]).length){
+      $('watch').innerHTML =
+        `<p><span class="watchname"><b>${w.total_requests} request ` +
+        `terpantau</b></span><br><span class="muted small">Pola: ` +
+        `${esc(w.patterns.join(', '))}</span></p>`;
+      $('watchTable').innerHTML =
+        '<tr><th>Host terpantau</th><th>Request</th></tr>' +
+        (w.hosts||[]).map(h=>
+          `<tr><td class="watchname">${esc(h[0])}</td>` +
+          `<td>${h[1]}</td></tr>`).join('');
+    }
+    window._recent = s.recent || [];
+    renderRecent();
+    const tops = s.top_hosts || [];
+    $('tops').innerHTML = '<tr><th>Host</th><th>Request</th></tr>' +
+      (tops.length ? tops.map(h=>
+        `<tr><td>${esc(h[0])}</td><td>${h[1]}</td></tr>`).join('')
+        : '<tr><td class="muted">belum ada data</td><td></td></tr>');
+  } catch(e) {
+    $('errbar').hidden = false;
+    $('livePill').className = 'pill err';
+    $('livePill').textContent = 'Terputus — mencoba lagi…';
+  }
   try {
     const ij = await (await fetch('/__intercepts')).json();
-    const pend = ij.pending || [];
-    if (pend.length){
-      document.getElementById('intercepts').innerHTML =
-        pend.map(p=>`<div class="card" style="display:block;margin:6px 0">#${p.id} <b>${p.phase}</b> ${p.method} ${p.host} ${p.target}`+
-        (p.body?` <span class="muted">${p.body.kind} ${p.body.size}B: ${String(p.body.preview).slice(0,120)}</span>`:'')+
-        ` <button onclick="resolveIntercept(${p.id},'release')">Release</button>`+
-        ` <button onclick="resolveIntercept(${p.id},'drop')">Drop</button></div>`).join('');
-    } else {
-      document.getElementById('intercepts').innerHTML = '<span class="muted">nothing held right now</span>';
-    }
+    renderIntercepts(ij.pending || []);
   } catch(e) {}
-  document.getElementById('tops').innerHTML =
-    '<tr><th>host</th><th>requests</th></tr>' +
-    (s.top_hosts||[]).map(h=>`<tr><td>${h[0]}</td><td>${h[1]}</td></tr>`).join('');
 }
-const SET_BOOL = ['PAYLOAD_CAPTURE','PAYLOAD_LGEB','INTERCEPT'];
-const SET_TEXT = ['PAYLOAD_ALLOW_HOSTS','PAYLOAD_MAX_BYTES','PAYLOAD_LGEB_CONTENT_HASH',
-  'INTERCEPT_ALLOW_HOSTS','INTERCEPT_TIMEOUT','PROXY_CACHE_TTL','PROXY_RATE_LIMIT','PROXY_LOG_FORMAT',
-  'PAC_HOSTS','PROXY_PUBLIC_HOST'];
-const SET_SECRET = ['PAYLOAD_LGEB_SALT_HEX','PAYLOAD_AES_KEY','PAYLOAD_AES_IV'];
+const FIELDS = [
+  {group:'Capture payload — lihat isi lalu lintas host milikmu'},
+  {k:'PAYLOAD_CAPTURE', t:'bool', label:'Rekam payload',
+   help:'Isi request/response untuk host di daftar bawah ditampilkan di detail koneksi.'},
+  {k:'PAYLOAD_ALLOW_HOSTS', t:'text', label:'Host yang direkam',
+   help:'Pisahkan dengan koma. Boleh wildcard, contoh: api.serverku.com, *.serverku.com'},
+  {k:'PAYLOAD_MAX_BYTES', t:'text', label:'Batas ukuran tampilan (byte)',
+   help:'Payload yang lebih besar dipotong di tampilan saja, bukan di lalu lintasnya.'},
+  {k:'PAYLOAD_LGEB', t:'bool', label:'Pembaca bundle LGEB',
+   help:'Coba dekripsi payload berformat LGEB (header LGEB + AES) memakai salt server A milikmu.'},
+  {k:'PAYLOAD_LGEB_CONTENT_HASH', t:'text', label:'Content hash LGEB (opsional)',
+   help:'Kosongkan untuk mengambil hash dari nama file bundle.'},
+  {k:'PAYLOAD_LGEB_SALT_HEX', t:'secret', label:'Salt LGEB server A',
+   help:'Rahasia. Kosongkan untuk mempertahankan yang sudah tersimpan.'},
+  {k:'PAYLOAD_AES_KEY', t:'secret', label:'Kunci AES payload (opsional)',
+   help:'Untuk payload AES-128-CBC biasa. Rahasia, hanya bisa diisi.'},
+  {k:'PAYLOAD_AES_IV', t:'secret', label:'IV AES payload (opsional)',
+   help:'Pasangan kunci di atas. Rahasia, hanya bisa diisi.'},
+  {group:'Intercept — tahan dulu, putuskan kemudian'},
+  {k:'INTERCEPT', t:'bool', label:'Aktifkan intercept',
+   help:'Request dan response untuk host di daftar bawah ditahan sampai kamu meneruskan atau menolaknya di panel Ditahan.'},
+  {k:'INTERCEPT_ALLOW_HOSTS', t:'text', label:'Host yang ditahan',
+   help:'Pisahkan dengan koma. Boleh wildcard.'},
+  {k:'INTERCEPT_TIMEOUT', t:'text', label:'Batas waktu menahan (detik)',
+   help:'Lewat waktu ini, yang ditahan diteruskan otomatis supaya trafikmu tidak menggantung.'},
+  {group:'HTTPS (MITM) — baca trafik terenkripsi host milikmu'},
+  {k:'MITM', t:'bool', label:'Aktifkan MITM',
+   help:'Proxy mengakhiri TLS untuk host di daftar bawah memakai CA lokal, sehingga payload HTTPS terbaca seperti HTTP. HP harus mempercayai CA-nya — lihat panel HTTPS di atas.'},
+  {k:'MITM_ALLOW_HOSTS', t:'text', label:'Host untuk MITM',
+   help:'Pisahkan dengan koma. Boleh wildcard. Hanya host milikmu.'},
+  {group:'Umum'},
+  {k:'PAC_HOSTS', t:'text', label:'Host lewat proxy di file PAC',
+   help:'Host yang diarahkan HP ke proxy ini; sisanya langsung (DIRECT).'},
+  {k:'PROXY_PUBLIC_HOST', t:'text', label:'Alamat publik proxy ini',
+   help:'Domain/IP publik + port, dipakai di file PAC. Contoh: 168.107.75.12:8089'},
+  {k:'PROXY_CACHE_TTL', t:'text', label:'Cache response GET (detik)',
+   help:'0 = mati. Response GET disimpan sebentar untuk request berulang.'},
+  {k:'PROXY_RATE_LIMIT', t:'text', label:'Batas request per menit per IP',
+   help:'0 = mati.'},
+  {k:'PROXY_LOG_FORMAT', t:'text', label:'Format log',
+   help:'text atau json.'},
+];
+window._cfg = null;
+
+function renderMitm(){
+  const el = $('mitmPanel');
+  const c = window._cfg;
+  if (!c){ el.innerHTML = '<p class="muted">Memuat status MITM…</p>'; return; }
+  const ca = c.mitm_ca || {};
+  let h = `<p>Status: ${c.MITM
+    ? '<span class="pill ok">Aktif</span>'
+    : '<span class="pill warn">Mati</span>'} · CA: ${ca.ready
+    ? '<span class="pill ok">Siap</span>'
+    : (ca.crypto_available
+      ? '<span class="pill warn">Dibuat saat MITM pertama kali aktif</span>'
+      : '<span class="pill err">Butuh paket cryptography di server</span>')}</p>`;
+  h += `<p class="muted small">Host yang di-MITM: <span class="mono">` +
+    `${esc(c.MITM_ALLOW_HOSTS || '(belum ada — isi di Pengaturan)')}</span>` +
+    ` · Verifikasi sertifikat asli server tujuan: ` +
+    `${ca.verify_upstream ? 'ya' : 'tidak (MITM_VERIFY_UPSTREAM=0)'}</p>`;
+  if (ca.fingerprint)
+    h += `<p class="muted small">Fingerprint SHA-256 CA — samakan dengan ` +
+      `yang tampil di HP saat memasang sertifikat:<br>` +
+      `<span class="mono">${esc(ca.fingerprint)}</span></p>`;
+  h += `<p><a class="btn primary" href="/__ca" download>Unduh sertifikat ` +
+    `CA (.crt)</a></p>`;
+  h += `<b>Pasang di HP, sekali saja:</b><ol class="steps">` +
+    `<li>Unduh file CA dari tombol di atas.</li>` +
+    `<li><b>Android:</b> Pengaturan → Keamanan → Pasang sertifikat → ` +
+    `Sertifikat CA → pilih file tadi.</li>` +
+    `<li><b>iPhone:</b> buka file-nya untuk memasang profil, lalu ` +
+    `Pengaturan → Umum → Tentang → Pengaturan Kepercayaan Sertifikat → ` +
+    `aktifkan untuk CA ini.</li>` +
+    `<li>Nyalakan MITM di Pengaturan dan isi host server milikmu. ` +
+    `Setelah itu, koneksi HTTPS ke host tersebut muncul sebagai request ` +
+    `yang terbaca — bukan lagi CONNECT buta.</li></ol>`;
+  h += `<p class="muted small">Aplikasi yang memakai certificate pinning ` +
+    `tetap menolak sertifikat ini; untuk aplikasi milikmu, atur dari sisi ` +
+    `aplikasinya. Yang diunduh hanya sertifikat publik CA — kunci ` +
+    `privatnya tidak pernah meninggalkan server.</p>`;
+  el.innerHTML = h;
+}
+
 async function loadSettings(){
   try {
     const c = await (await fetch('/__config')).json();
-    let h = '';
-    for (const k of SET_BOOL)
-      h += `<label style="display:block"><input type="checkbox" id="cfg_${k}" ${c[k]?'checked':''}> ${k}</label>`;
-    for (const k of SET_TEXT)
-      h += `<label style="display:block">${k} <input id="cfg_${k}" value="${String(c[k]??'').replace(/"/g,'&quot;')}" size="42"></label>`;
-    for (const k of SET_SECRET)
-      h += `<label style="display:block">${k} <input type="password" id="cfg_${k}" size="42" placeholder="${c.secrets_set[k]?'set — leave blank to keep':'not set'}"></label>`;
+    window._cfg = c;
+    let h = '', open = false;
+    for (const f of FIELDS){
+      if (f.group){
+        if (open) h += '</fieldset>';
+        h += `<fieldset><legend>${esc(f.group)}</legend>`;
+        open = true;
+        continue;
+      }
+      if (f.t === 'bool'){
+        h += `<div class="field"><label class="check">` +
+          `<input type="checkbox" id="cfg_${f.k}" ${c[f.k]?'checked':''}>` +
+          `<span>${esc(f.label)}<span class="help" style="display:block">` +
+          `${esc(f.help)}</span></span></label></div>`;
+      } else if (f.t === 'secret'){
+        const isSet = (c.secrets_set || {})[f.k];
+        h += `<div class="field"><label for="cfg_${f.k}">` +
+          `${esc(f.label)}</label>` +
+          `<input type="password" id="cfg_${f.k}" autocomplete="off" ` +
+          `placeholder="${isSet ? 'sudah tersimpan — kosongkan untuk mempertahankan' : 'belum diisi'}">` +
+          `<div class="help">${esc(f.help)}</div></div>`;
+      } else {
+        h += `<div class="field"><label for="cfg_${f.k}">` +
+          `${esc(f.label)}</label>` +
+          `<input type="text" id="cfg_${f.k}" ` +
+          `value="${esc(c[f.k] ?? '')}">` +
+          `<div class="help">${esc(f.help)}</div></div>`;
+      }
+    }
+    if (open) h += '</fieldset>';
     const r = c.restart_only || {};
-    h += `<div class="muted">restart-only (saved to .env, applied next start): PROXY_HOST=${r.PROXY_HOST} · PROXY_PORT=${r.PROXY_PORT} · PROXY_MODE=${r.PROXY_MODE}</div>`;
-    document.getElementById('settingsForm').innerHTML = h;
-  } catch(e) {}
+    h += `<p class="muted small">Pengaturan bind — tersimpan ke .env, ` +
+      `berlaku setelah restart: PROXY_HOST=${esc(r.PROXY_HOST)} · ` +
+      `PROXY_PORT=${esc(r.PROXY_PORT)} · PROXY_MODE=${esc(r.PROXY_MODE)}` +
+      (r.PROXY_UPSTREAM ? ` · PROXY_UPSTREAM=${esc(r.PROXY_UPSTREAM)}` : '') +
+      `</p>`;
+    $('settingsForm').innerHTML = h;
+  } catch(e) {
+    $('settingsForm').innerHTML =
+      '<p class="muted">Gagal memuat pengaturan — server tidak menjawab.</p>';
+  }
+  renderMitm();
 }
+
 window.saveSettings = async function(){
   const body = new URLSearchParams();
-  for (const k of SET_BOOL) body.set(k, document.getElementById('cfg_'+k).checked ? '1' : '0');
-  for (const k of SET_TEXT) body.set(k, document.getElementById('cfg_'+k).value);
-  for (const k of SET_SECRET){ const v = document.getElementById('cfg_'+k).value; if (v) body.set(k, v); }
-  body.set('PERSIST', document.getElementById('setPersist').checked ? '1' : '0');
-  const r = await (await fetch('/__config', {method:'POST', body})).json();
-  document.getElementById('settingsMsg').textContent =
-    'saved: ' + (r.applied||[]).join(', ') + (r.persisted ? ' · written to .env' : ' · live only') +
-    ((r.restart_required_for||[]).length ? ' · restart needed for ' + r.restart_required_for.join(', ') : '');
+  for (const f of FIELDS){
+    if (!f.k) continue;
+    const el = $('cfg_' + f.k);
+    if (!el) continue;
+    if (f.t === 'bool') body.set(f.k, el.checked ? '1' : '0');
+    else if (f.t === 'secret'){ if (el.value) body.set(f.k, el.value); }
+    else body.set(f.k, el.value);
+  }
+  body.set('PERSIST', $('setPersist').checked ? '1' : '0');
+  const msg = $('settingsMsg');
+  try {
+    const r = await (await fetch('/__config', {method:'POST', body})).json();
+    msg.textContent = 'Tersimpan — ' + (r.applied||[]).length +
+      ' pengaturan berlaku sekarang' +
+      (r.persisted ? ', ditulis ke .env' : ', hanya sesi ini') +
+      ((r.restart_required_for||[]).length
+        ? '. Perlu restart untuk: ' + r.restart_required_for.join(', ')
+        : '') + '.';
+  } catch(e) {
+    msg.textContent = 'Gagal menyimpan — server tidak menjawab.';
+  }
   loadSettings();
 };
-loadSettings();
 window.resolveIntercept = async function(id, action){
   await fetch('/__intercept/' + action + '?id=' + id);
   tick();
 };
+
 window.showDetail = function(i){
-  const e = (window._recent||[])[i]; if(!e) return;
-  const rows = [['Connection #',e.id],['Time',e.time],['Client (peer)',e.peer],
-    ['Method',e.method],['Host',e.host],['Target / path',e.target],
-    ['Status',e.status],['Bytes (request side)',e.bytes],['Duration',e.duration_ms+' ms'],
-    ['Watched (Lumi watchlist)',e.watched?'yes':'no']];
+  const e = (window._shown||[])[i]; if(!e) return;
+  const rows = [['Nomor koneksi', '#' + e.id], ['Waktu', e.time],
+    ['Klien', e.peer], ['Method', e.method], ['Host', e.host],
+    ['Target / path', e.target], ['Status', e.status],
+    ['Ukuran (sisi request)', fmtBytes(e.bytes)],
+    ['Durasi', fmtMs(e.duration_ms)],
+    ['Di watchlist', e.watched ? 'ya' : 'tidak']];
+  let h = `<div style="display:flex;justify-content:space-between;` +
+    `align-items:center;gap:10px"><b>Detail koneksi #${e.id}</b>` +
+    `<button type="button" id="btnCloseDetail">Tutup</button></div>` +
+    `<table>` + rows.map(r=>
+      `<tr><td class="muted" style="width:190px">${r[0]}</td>` +
+      `<td>${esc(r[1])}</td></tr>`).join('') + `</table>`;
   if (e.payload){
-    for (const k of ['request','response','request_decrypted','response_decrypted','request_lgeb','response_lgeb']){
+    const names = {request:'Payload request', response:'Payload response',
+      request_decrypted:'Request terdekripsi (AES)',
+      response_decrypted:'Response terdekripsi (AES)',
+      request_lgeb:'Request terdekripsi (LGEB)',
+      response_lgeb:'Response terdekripsi (LGEB)'};
+    for (const k of Object.keys(names)){
       const v = e.payload[k];
-      if (v) rows.push([k+' ('+v.kind+', '+v.size+' B'+(v.truncated?', truncated':'')+')',
-                        '<pre style="white-space:pre-wrap;word-break:break-all">'+
-                        String(v.preview).replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre>']);
+      if (v) h += `<h3 class="small" style="margin:12px 0 2px">` +
+        `${names[k]} <span class="muted">(${esc(v.kind)}, ` +
+        `${fmtBytes(v.size)}${v.truncated?', terpotong di tampilan':''})` +
+        `</span></h3><pre>${esc(v.preview)}</pre>`;
     }
+  } else if (String(e.method).toUpperCase() === 'CONNECT'){
+    h += `<p class="muted">Payload tidak ada: ini terowongan CONNECT ` +
+      `(HTTPS) — isinya terenkripsi ujung-ke-ujung antara HP dan server ` +
+      `tujuan, proxy hanya meneruskan. Supaya terbaca, aktifkan MITM ` +
+      `untuk host ini di Pengaturan dan pasang sertifikat CA di HP.</p>`;
   } else {
-    rows.push(['Payload','not captured for this host (enable PAYLOAD_CAPTURE + PAYLOAD_ALLOW_HOSTS for your own server)']);
+    h += `<p class="muted">Payload tidak direkam untuk host ini. ` +
+      `Nyalakan "Rekam payload" di Pengaturan dan masukkan host-nya ke ` +
+      `daftar host yang direkam.</p>`;
   }
-  document.getElementById('detail').innerHTML =
-    '<b>Connection detail</b><table>' +
-    rows.map(r=>`<tr><td class="muted">${r[0]}</td><td>${r[1]}</td></tr>`).join('') + '</table>';
+  const d = $('detail');
+  d.innerHTML = h;
+  d.hidden = false;
+  $('btnCloseDetail').addEventListener('click', ()=>{ d.hidden = true; });
+  d.scrollIntoView({block:'nearest'});
 };
-tick(); setInterval(tick, 2000);
+
+document.querySelectorAll('.chip').forEach(ch=>
+  ch.addEventListener('click', ()=>{
+    document.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));
+    ch.classList.add('on');
+    window._filter = ch.dataset.f;
+    renderRecent();
+  }));
+$('q').addEventListener('input', renderRecent);
+$('btnRefresh').addEventListener('click', tick);
+$('btnSave').addEventListener('click', ()=>window.saveSettings());
+$('pacUrl').value = location.origin + '/proxy.pac';
+$('btnCopyPac').addEventListener('click', async ()=>{
+  try { await navigator.clipboard.writeText($('pacUrl').value); }
+  catch(e){ $('pacUrl').select(); document.execCommand('copy'); }
+  $('pacMsg').textContent = 'Tersalin — tempel di pengaturan Wi-Fi HP.';
+});
+document.addEventListener('keydown', ev=>{
+  if (ev.key === 'Escape') $('detail').hidden = true;
+});
+setInterval(()=>{ if ($('autoRefresh').checked) tick(); }, 2000);
+loadSettings();
+tick();
 </script></body></html>
 """
 
@@ -1168,6 +1920,11 @@ def config_from_env_and_args(argv=None) -> Config:
                    default=os.getenv("INTERCEPT", "") in ("1", "true", "yes"),
                    help="hold request/response for INTERCEPT_ALLOW_HOSTS "
                         "until released/dropped from the dashboard")
+    p.add_argument("--mitm", action="store_true",
+                   default=os.getenv("MITM", "") in ("1", "true", "yes"),
+                   help="terminate TLS for MITM_ALLOW_HOSTS with a local "
+                        "CA so HTTPS traffic can be captured/intercepted "
+                        "(needs the cryptography package)")
     p.add_argument("--watch", action="append", default=[],
                    help="watchlist host pattern for the dashboard, repeatable")
     p.add_argument("--lumi", action="store_true",
@@ -1211,6 +1968,13 @@ def config_from_env_and_args(argv=None) -> Config:
         or tuple(file_cfg.get("pac_hosts", [])),
         public_host=os.getenv("PROXY_PUBLIC_HOST", "")
         or file_cfg.get("public_host", ""),
+        mitm=bool(a.mitm or file_cfg.get("mitm")),
+        mitm_allow_hosts=_csv(os.getenv("MITM_ALLOW_HOSTS", ""))
+        or tuple(file_cfg.get("mitm_allow_hosts", [])),
+        mitm_ca_dir=os.getenv("MITM_CA_DIR", "")
+        or file_cfg.get("mitm_ca_dir", ".proxy-ca"),
+        mitm_verify_upstream=os.getenv("MITM_VERIFY_UPSTREAM", "1")
+        not in ("0", "false", "no"),
     )
 
 
@@ -1219,6 +1983,15 @@ async def serve(cfg: Config) -> None:
     server = await asyncio.start_server(proxy.handle, cfg.host, cfg.port)
     print(f"proxy-server listening on {cfg.host}:{cfg.port} mode={cfg.mode}"
           + (f" upstream={cfg.upstream}" if cfg.upstream else ""), flush=True)
+    if cfg.mitm:
+        if proxy._maybe_ca():
+            print(f"mitm on for {list(cfg.mitm_allow_hosts)}; "
+                  f"CA cert: http://{cfg.host}:{cfg.port}/__ca "
+                  f"(fingerprint {proxy.ca.fingerprint()})", flush=True)
+        else:
+            print("mitm requested but unavailable: install the "
+                  "cryptography package (pip install cryptography)",
+                  flush=True)
     async with server:
         await server.serve_forever()
 
