@@ -1,0 +1,12 @@
+{
+  "cache_ttl": 60,
+  "rate_limit": 120,
+  "block_hosts": [
+    "*.ads.example",
+    "tracker.example"
+  ],
+  "allow_hosts": [],
+  "log_file": "proxy.log",
+  "log_format": "json",
+  "lumi": true
+}

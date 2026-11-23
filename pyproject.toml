@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proxy-server"
+version = "0.7.0"
+description = "Small dependency-free HTTP forward and reverse proxy server"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "RIZKY" }]
+keywords = ["proxy", "http", "reverse-proxy", "asyncio"]
+
+[project.scripts]
+proxy-server = "proxy_server.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
