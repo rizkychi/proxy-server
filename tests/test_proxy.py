@@ -131,6 +131,10 @@ async def scenario_dashboard():
     # dashboard page
     data = await raw(b"GET /__dashboard HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     assert b"Dashboard proxy-server" in data and b"--lumi" in data, data[:200]
+    # 0.9.5 interactive shell: right detail drawer, modal, toasts, retry
+    for marker in (b"toastStack", b"modalBackdrop", b"drawer",
+                   b"Lihat penuh", b"btnRetry", b"detailBody"):
+        assert marker in data, marker
 
     # stats: recent + watch structure
     data = await raw(b"GET /__stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -571,3 +575,68 @@ def test_mitm_https_own_host():
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         run(scenario_mitm(tmp))
+
+
+async def scenario_dashboard_auth():
+    proxy = Proxy(Config(dashboard_auth="admin:test-pass"))
+    proxy_server = await asyncio.start_server(proxy.handle, "127.0.0.1", 0)
+    proxy_port = proxy_server.sockets[0].getsockname()[1]
+
+    async def raw(method, path, body=b"", cookie=""):
+        r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
+        head = (f"{method} {path} HTTP/1.1\r\nHost: x\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n")
+        if cookie:
+            head += f"Cookie: {cookie}\r\n"
+        w.write(head.encode() + b"\r\n" + body)
+        data = await r.read()
+        w.close()
+        return data
+
+    # dashboard and admin APIs are closed without a session
+    data = await raw("GET", "/__dashboard")
+    assert b"302" in data.split(b"\r\n")[0] and b"/__login" in data, data[:200]
+    data = await raw("GET", "/__stats")
+    assert b"401" in data.split(b"\r\n")[0], data[:200]
+    data = await raw("GET", "/__config")
+    assert b"401" in data.split(b"\r\n")[0], data[:200]
+
+    # login page renders with the admin form
+    data = await raw("GET", "/__login")
+    assert b"200" in data.split(b"\r\n")[0] and b"Login Dashboard" in data
+    assert b'name="username"' in data and b'name="password"' in data
+
+    # wrong password bounces back to the login page with an error flag
+    data = await raw("POST", "/__login", b"username=admin&password=salah")
+    assert b"error=1" in data, data[:300]
+
+    # correct password creates a session cookie and redirects in
+    data = await raw("POST", "/__login",
+                     b"username=admin&password=test-pass")
+    assert b"302" in data.split(b"\r\n")[0], data[:200]
+    cookie_line = [ln for ln in data.split(b"\r\n")
+                   if ln.lower().startswith(b"set-cookie:")][0]
+    cookie = cookie_line.split(b":", 1)[1].strip().split(b";")[0].decode()
+    assert cookie.startswith("proxy_dashboard_session="), cookie
+
+    # with the cookie the new admin layout is served
+    data = await raw("GET", "/__dashboard", cookie=cookie)
+    assert b"200" in data.split(b"\r\n")[0], data[:200]
+    for marker in (b"Admin Console", b"sidebarToggle", b"userDropdown",
+                   b"globalSearch", b"quick-card", b"sidebarLogoutBtn",
+                   b"Menu utama", b"Keluar"):
+        assert marker in data, marker
+    data = await raw("GET", "/__session", cookie=cookie)
+    assert b'"authenticated": true' in data and b'"user": "admin"' in data
+
+    # logout kills the session server-side, not just the cookie
+    data = await raw("POST", "/__logout", cookie=cookie)
+    assert b'"ok": true' in data, data[:200]
+    data = await raw("GET", "/__dashboard", cookie=cookie)
+    assert b"302" in data.split(b"\r\n")[0], data[:200]
+
+    proxy_server.close()
+
+
+def test_dashboard_login_logout():
+    run(scenario_dashboard_auth())

@@ -251,6 +251,56 @@ rows (Enter opens detail, Esc closes), an offline banner when the
 server stops answering, a copyable PAC URL, and plain-language panels
 for intercept ("Ditahan"), the watchlist, and MITM setup.
 
+In 0.9.1 the dashboard layout became a multi-view admin UI with five
+hash-routed views (`#/lalu-lintas`, …) so a refresh keeps your place:
+**Ringkasan**, **Lalu lintas**, **Ditahan**, **HTTPS**, **Pengaturan**.
+
+In 0.9.2 the dashboard was redesigned under the direction recorded in
+`DESIGN.md` (an operations logbook: warm paper, ink, ruled sections).
+Totals are a ledger strip instead of KPI cards, navigation is a
+numbered text rail on desktop and a fixed bottom tab bar on phones,
+status is colored text with a square swatch instead of pill badges,
+and there are no icons, shadows, or gradients. All text meets WCAG AA
+contrast on the paper background.
+
+In 0.9.3 the dashboard was rebuilt again, this time on a design
+system generated with the UI/UX Pro Max skill and persisted in
+`design-system/proxy-server/` (MASTER.md, a dashboard page override,
+and token files). The system is a dark slate console (background
+`#0F172A`, cards `#1B2336`, accent green `#22C55E`) with Fira Sans
+body text, Fira Code headings and data, and a dense 2/4/8/12/16/24/32
+spacing scale. `DESIGN.md` records the fit checks: the generated
+landing-page pattern and glassmorphism style were adapted to solid
+surfaces for a live data console, while palette, typography, and
+density are applied as generated. All text meets WCAG AA contrast.
+
+In 0.9.4 the dashboard shell became a conventional admin layout:
+a grouped sidebar (Menu utama / Konfigurasi / Sistem) that collapses
+to icons on desktop and slides in as a drawer on phones, a sticky
+topbar with breadcrumb, global traffic search, live status, and a
+user menu, quick-action cards on the Dashboard view, and a profile
+card with sign-out in the sidebar. It also gained a real dashboard
+login: set `DASHBOARD_AUTH=user:password` in `.env` (separate from
+`PROXY_AUTH`) and `/__dashboard` plus its admin APIs (stats, config,
+intercepts, CA download) require a session from `/__login`; sign out
+from the user menu or the sidebar profile card. Sessions are held in
+memory with an HttpOnly cookie (`DASHBOARD_SESSION_TTL`, default
+43200 seconds), so a restart signs everyone out. Without
+`DASHBOARD_AUTH` the dashboard stays open and the user menu shows
+how to enable login.
+
+Version 0.9.5 replaced the visual design entirely: a light, modern
+admin theme (soft gray background, white surfaces, indigo accent,
+Plus Jakarta Sans for UI text and IBM Plex Mono for data), recorded
+in `DESIGN.md`. Interaction was rebuilt around it: connection
+details open in a right-hand slide-over drawer (click a row to show
+or hide it, the row stays highlighted), destructive intercept drops
+ask for confirmation in a modal dialog with proper focus handling,
+payload previews can be opened full-size in a modal, and actions
+report back through toast notifications. Success toasts dismiss
+themselves; errors stay in a persistent alert with a retry button
+until the connection recovers.
+
 ### Connection detail (0.3.1)
 
 Click any row in **Recent traffic** to open its detail panel: connection id,
