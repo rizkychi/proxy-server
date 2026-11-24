@@ -128,6 +128,14 @@ async def scenario_dashboard():
                      f"Host: 127.0.0.1:{origin_port}\r\nConnection: close\r\n\r\n".encode())
     assert b"hello-from-origin" in data
 
+    # 0.9.8: per-minute series for the dashboard chart (60 buckets,
+    # sums consistent with the counters, current minute has the hit)
+    snap = proxy.stats.snapshot()
+    assert len(snap["series"]) == 60, len(snap["series"])
+    assert sum(b["requests"] for b in snap["series"]) == snap["requests"]
+    assert sum(b["bytes"] for b in snap["series"]) == snap["bytes_sent"]
+    assert snap["series"][-1]["requests"] >= 1
+
     # dashboard page
     data = await raw(b"GET /__dashboard HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     assert b"Dashboard proxy-server" in data and b"--lumi" in data, data[:200]
@@ -135,6 +143,12 @@ async def scenario_dashboard():
     for marker in (b"toastStack", b"modalBackdrop", b"drawer",
                    b"Lihat penuh", b"btnRetry", b"detailBody"):
         assert marker in data, marker
+    # 0.9.7: selects are custom styled, not the native dropdown look
+    assert b"appearance:none" in data and b"prefTheme" in data
+    # 0.9.9: status/method filter selects in the traffic toolbar
+    assert b"fStatus" in data and b"fMethod" in data
+    # 0.10.0: intercept body editor in the held panel
+    assert b"editIntercept" in data and b"editBody" in data
 
     # stats: recent + watch structure
     data = await raw(b"GET /__stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -224,7 +238,44 @@ async def scenario_payload():
     ev = proxy.stats.recent[0]
     assert ev["payload"]["request"]["preview"] == "hello", ev
     assert ev["payload"]["response"]["preview"] == "echo:hello", ev
+    # 0.9.9: headers captured, byte split adds up, gzip opened
+    assert "POST" in ev["payload"]["request_headers"]["preview"], ev
+    assert "host:" in ev["payload"]["request_headers"]["preview"], ev
+    assert "200" in ev["payload"]["response_headers"]["preview"], ev
+    assert ev["bytes_up"] > 0 and ev["bytes_down"] > 0, ev
+    assert ev["bytes"] == ev["bytes_up"] + ev["bytes_down"], ev
     proxy_server.close()
+
+    import gzip as _gzip
+
+    async def gzip_origin(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        body = _gzip.compress(b'{"hello": "gzip-world"}')
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                     b"Content-Encoding: gzip\r\nContent-Length: "
+                     + str(len(body)).encode()
+                     + b"\r\nConnection: close\r\n\r\n" + body)
+        await writer.drain()
+        writer.close()
+
+    gz_server = await asyncio.start_server(gzip_origin, "127.0.0.1", 0)
+    gz_port = gz_server.sockets[0].getsockname()[1]
+    proxy3 = Proxy(Config(payload_capture=True,
+                          payload_allow_hosts=("127.0.0.1",)))
+    srv3 = await asyncio.start_server(proxy3.handle, "127.0.0.1", 0)
+    port3 = srv3.sockets[0].getsockname()[1]
+    r, w = await asyncio.open_connection("127.0.0.1", port3)
+    w.write(f"GET http://127.0.0.1:{gz_port}/data HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{gz_port}\r\nConnection: close\r\n\r\n".encode())
+    data = await r.read()
+    assert _gzip.decompress(data.partition(b"\r\n\r\n")[2]) == \
+        b'{"hello": "gzip-world"}'  # client still gets the raw gzip body
+    w.close()
+    resp = proxy3.stats.recent[0]["payload"]["response"]
+    assert resp["kind"] == "text" and resp["encoding"] == "gzip", resp
+    assert "gzip-world" in resp["preview"], resp
+    srv3.close()
+    gz_server.close()
 
     # capture OFF by default -> no payload stored
     proxy2 = Proxy(Config())
@@ -298,12 +349,116 @@ async def scenario_intercept():
     await call_api(f"/__intercept/drop?id={rid}")
     assert b"403" in await task
 
+    # 0.10.0: edit the held request body -> origin receives the edit
+    import json as _json
+
+    async def call_json(method, path, obj=None):
+        payload = _json.dumps(obj).encode() if obj is not None else b""
+        r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
+        w.write((f"{method} {path} HTTP/1.1\r\nHost: x\r\n"
+                 f"Content-Type: application/json\r\n"
+                 f"Content-Length: {len(payload)}\r\n"
+                 f"Connection: close\r\n\r\n").encode() + payload)
+        data = await r.read()
+        w.close()
+        return _json.loads(data.partition(b"\r\n\r\n")[2])
+
+    task = asyncio.create_task(do_post())
+    rid = await wait_phase("request")
+    info = await call_json("GET", f"/__intercept/body?id={rid}")
+    assert info["ok"] and info["edit_mode"] == "text", info
+    assert info["edit_text"] == "he", info
+    out = await call_json("POST", f"/__intercept/edit?id={rid}",
+                          {"text": "halo-baru"})
+    assert out["ok"] and out["size"] == len("halo-baru"), out
+    assert proxy.intercepts[rid]["edited"] is True
+    await call_api(f"/__intercept/release?id={rid}")
+    sid = await wait_phase("response")
+    await call_api(f"/__intercept/release?id={sid}")
+    assert b"echo:halo-baru" in await task
+
     proxy_server.close()
     origin_server.close()
 
 
 def test_intercept_bidirectional():
     run(scenario_intercept())
+
+
+async def scenario_intercept_lgeb_edit():
+    from proxy_server.server import lgeb_decrypt_raw, lgeb_encrypt_raw
+
+    salt = "00112233445566778899aabbccddeeff"
+    chash = "0123456789abcdef0123456789abcdef"
+    body = lgeb_encrypt_raw(b'{"mode": "lama"}', salt, chash, 7)
+    assert body is not None and body[:4] == b"LGEB"
+
+    origin_server = await asyncio.start_server(echo_origin, "127.0.0.1", 0)
+    origin_port = origin_server.sockets[0].getsockname()[1]
+    proxy = Proxy(Config(intercept=True,
+                         intercept_allow_hosts=("127.0.0.1",),
+                         intercept_timeout=10,
+                         payload_lgeb=True,
+                         payload_lgeb_salt_hex=salt))
+    proxy_server = await asyncio.start_server(proxy.handle, "127.0.0.1", 0)
+    proxy_port = proxy_server.sockets[0].getsockname()[1]
+
+    import json as _json
+
+    async def call_json(method, path, obj=None):
+        payload = _json.dumps(obj).encode() if obj is not None else b""
+        r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
+        w.write((f"{method} {path} HTTP/1.1\r\nHost: x\r\n"
+                 f"Content-Type: application/json\r\n"
+                 f"Content-Length: {len(payload)}\r\n"
+                 f"Connection: close\r\n\r\n").encode() + payload)
+        data = await r.read()
+        w.close()
+        return _json.loads(data.partition(b"\r\n\r\n")[2])
+
+    async def wait_id(phase):
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            for item in proxy.intercepts.values():
+                if item["phase"] == phase:
+                    return item["id"]
+        raise AssertionError(f"no {phase} intercept appeared")
+
+    async def do_post():
+        r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
+        w.write(f"POST http://127.0.0.1:{origin_port}"
+                f"/bundles/pack_{chash}.bundle HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{origin_port}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"Connection: close\r\n\r\n".encode() + body)
+        data = await r.read()
+        w.close()
+        return data
+
+    task = asyncio.create_task(do_post())
+    rid = await wait_id("request")
+    info = await call_json("GET", f"/__intercept/body?id={rid}")
+    assert info["ok"] and info["edit_mode"] == "lgeb", info
+    assert info["edit_text"] == '{"mode": "lama"}', info
+    out = await call_json("POST", f"/__intercept/edit?id={rid}",
+                          {"text": '{"mode": "baru", "n": 2}'})
+    assert out["ok"], out
+    await call_json("GET", f"/__intercept/release?id={rid}")
+    sid = await wait_id("response")
+    await call_json("GET", f"/__intercept/release?id={sid}")
+    data = await task
+    echoed = data.partition(b"\r\n\r\n")[2]
+    assert echoed.startswith(b"echo:"), echoed[:40]
+    dec = lgeb_decrypt_raw(echoed[5:], salt, chash)
+    assert dec is not None and dec[0] == b'{"mode": "baru", "n": 2}', dec
+    assert dec[1] == 7  # resVersion preserved
+
+    proxy_server.close()
+    origin_server.close()
+
+
+def test_intercept_lgeb_edit():
+    run(scenario_intercept_lgeb_edit())
 
 
 async def scenario_config_dashboard():
@@ -623,8 +778,15 @@ async def scenario_dashboard_auth():
     data = await raw("GET", "/__dashboard", cookie=cookie)
     assert b"200" in data.split(b"\r\n")[0], data[:200]
     for marker in (b"Admin Console", b"sidebarToggle", b"userDropdown",
-                   b"globalSearch", b"quick-card", b"sidebarLogoutBtn",
+                   b"globalSearch", b"quick-card", b"logoutBtn",
                    b"Menu utama", b"Keluar"):
+        assert marker in data, marker
+    # 0.9.6: no profile card in the sidebar, logout lives in the topbar
+    assert b"sidebarLogoutBtn" not in data
+    # 0.9.6: table paging/sorting/search + prefs (refresh, language, theme)
+    for marker in (b"pageSize", b"pagePrev", b"pageNext", b"pageInfo",
+                   b"prefAutoRefresh", b"prefInterval", b"prefLang",
+                   b"prefTheme", b"data-theme"):
         assert marker in data, marker
     data = await raw("GET", "/__session", cookie=cookie)
     assert b'"authenticated": true' in data and b'"user": "admin"' in data

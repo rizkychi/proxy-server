@@ -58,6 +58,28 @@ follows the same focus and dismissal rules as its modal guidance.
 - Loading uses skeleton blocks for the metric cards; the rest of the
   views keep their previous content during refresh.
 
+## 0.9.6 addendum
+
+- Topbar reduced to essentials: menu toggle, breadcrumb and title,
+  global search, user menu. The live pill, manual refresh button,
+  auto-refresh checkbox, and view subtitles were removed; sign-out
+  lives only in the topbar user dropdown, and the sidebar profile
+  card was removed.
+- The traffic table is a full data table: text search, quick filter
+  chips, click-to-sort headers (time, method, host, status, size,
+  duration), and paging with a page-size selector and page info.
+- Settings gained a browser-preferences panel: auto-refresh toggle
+  and interval (the refresh rules live here now, not in the topbar),
+  language (Indonesian / English across the whole dashboard,
+  including generated panels), and theme. Preferences persist in
+  localStorage; the login page follows the theme choice.
+- Dark theme tokens (same design language, dark surfaces):
+  background `#0C1222`, card/sidebar `#151C2E`, muted surface
+  `#1D2740`, foreground `#E8EDF7`, muted foreground `#94A3B8`,
+  accent `#818CF8` with on-accent `#0B1020`, status ok `#4ADE80`,
+  warn `#FBBF24`, info `#38BDF8`, error `#F87171`. The theme is set
+  on the document element before first paint to avoid a flash.
+
 ## Hard constraints
 
 - All five views and every existing control keep working; the login

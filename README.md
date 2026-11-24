@@ -301,6 +301,18 @@ report back through toast notifications. Success toasts dismiss
 themselves; errors stay in a persistent alert with a retry button
 until the connection recovers.
 
+Version 0.9.6 cleaned the chrome and finished the data table. The
+topbar now holds only the menu toggle, breadcrumb and title, global
+search, and the user menu (sign-out lives there; the sidebar profile
+card is gone), and the traffic table gained full searching,
+click-to-sort column headers, and paging with a page-size selector.
+Refresh behaviour moved to Settings, which gained a browser
+preferences panel: auto-refresh on/off, refresh interval, language
+(Indonesian / English, applied across the whole dashboard), and
+theme (light / dark). Preferences are stored in the browser
+(localStorage), not in the server configuration; the login page
+follows the chosen theme.
+
 ### Connection detail (0.3.1)
 
 Click any row in **Recent traffic** to open its detail panel: connection id,

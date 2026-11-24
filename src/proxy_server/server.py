@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import gzip
 import hashlib
 import hmac
 import html
@@ -32,6 +33,7 @@ import secrets
 import ssl
 import sys
 import time
+import zlib
 from dataclasses import dataclass
 from urllib.parse import parse_qs, quote, urlsplit
 
@@ -170,6 +172,40 @@ def preview_bytes(data: bytes, limit: int) -> dict:
             "size": len(data), "truncated": len(data) > limit}
 
 
+def try_decompress(data: bytes):
+    """(plain, encoding) for gzip/zlib bodies, else None.
+
+    Sniffed by magic bytes so it works even when the Content-Encoding
+    header was not captured. Brotli is not in the stdlib and is left
+    as raw hex.
+    """
+    if data[:2] == b"\x1f\x8b":
+        try:
+            return gzip.decompress(data), "gzip"
+        except Exception:
+            return None
+    if data[:1] == b"\x78":
+        try:
+            return zlib.decompress(data), "zlib"
+        except Exception:
+            return None
+    return None
+
+
+def preview_body(data: bytes, limit: int) -> dict:
+    """Body preview that transparently opens gzip/zlib bodies."""
+    raw = preview_bytes(data, limit)
+    if raw["kind"] == "hex":
+        opened = try_decompress(data)
+        if opened is not None:
+            plain, enc = opened
+            dec = preview_bytes(plain, limit)
+            dec["encoding"] = enc
+            dec["raw_size"] = len(data)
+            return dec
+    return raw
+
+
 def try_aes_decrypt(data: bytes, key_s: str, iv_s: str) -> dict | None:
     """Optional AES-128-CBC / PKCS#7 decrypt of a captured body.
 
@@ -260,6 +296,64 @@ def try_lgeb_decrypt(data: bytes, salt_hex: str, content_hash: str,
     except Exception as exc:
         return {"kind": "note", "preview": f"LGEB decrypt failed: {exc!r}",
                 "size": len(data), "truncated": False}
+
+
+def _lgeb_key_iv(salt_hex: str, content_hash: str, res_version: int):
+    salt = _decode_key_material(salt_hex)
+    digest = hashlib.sha256(
+        salt + f"{content_hash}:{res_version}".encode()).digest()
+    return digest[:16], digest[16:]
+
+
+def lgeb_decrypt_raw(data: bytes, salt_hex: str, content_hash: str):
+    """Decrypt an LGEB body to (plaintext, res_version), or None.
+
+    Strict PKCS#7 validation: anything that does not check out is a
+    failed decryption, not a partially stripped plaintext.
+    """
+    if not data or data[:4] != b"LGEB" or len(data) < 8 + 16:
+        return None
+    if not salt_hex or not content_hash:
+        return None
+    res_version = int.from_bytes(data[4:8], "little")
+    try:
+        from cryptography.hazmat.primitives.ciphers import (
+            Cipher, algorithms, modes)
+    except ImportError:
+        return None
+    try:
+        key, iv = _lgeb_key_iv(salt_hex, content_hash, res_version)
+        decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        plain = decryptor.update(data[8:]) + decryptor.finalize()
+        if not plain:
+            return None
+        pad = plain[-1]
+        if not (1 <= pad <= 16) or plain[-pad:] != bytes([pad]) * pad:
+            return None
+        return plain[:-pad], res_version
+    except Exception:
+        return None
+
+
+def lgeb_encrypt_raw(plain: bytes, salt_hex: str, content_hash: str,
+                     res_version: int) -> bytes | None:
+    """Re-encrypt plaintext into an LGEB body (same derivation)."""
+    if not salt_hex or not content_hash:
+        return None
+    try:
+        from cryptography.hazmat.primitives.ciphers import (
+            Cipher, algorithms, modes)
+    except ImportError:
+        return None
+    try:
+        key, iv = _lgeb_key_iv(salt_hex, content_hash, res_version)
+        pad = 16 - (len(plain) % 16)
+        padded = plain + bytes([pad]) * pad
+        encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+        ct = encryptor.update(padded) + encryptor.finalize()
+        return b"LGEB" + res_version.to_bytes(4, "little") + ct
+    except Exception:
+        return None
 
 
 def host_matches(host: str, patterns) -> bool:
@@ -441,16 +535,19 @@ class Stats:
         self.by_host = Counter()
         self.recent: deque = deque(maxlen=200)
         self.watch_patterns: tuple = ()
+        self.series: dict = {}  # minute epoch -> [requests, bytes, errors]
 
     _next_id = 0
 
     def record_event(self, ts, method, host, status, nbytes, duration_ms,
-                     peer="-", target="-", payload=None):
+                     peer="-", target="-", payload=None,
+                     bytes_up=0, bytes_down=0):
         Stats._next_id += 1
         self.recent.appendleft({
             "id": Stats._next_id,
             "time": ts, "method": method, "host": host, "status": status,
-            "bytes": nbytes, "duration_ms": duration_ms,
+            "bytes": nbytes, "bytes_up": bytes_up,
+            "bytes_down": bytes_down, "duration_ms": duration_ms,
             "peer": peer, "target": target, "payload": payload,
             "watched": bool(self.watch_patterns and host
                             and host_matches(str(host), self.watch_patterns)),
@@ -464,6 +561,24 @@ class Stats:
             self.by_host[str(host)] += 1
         if status >= 500:
             self.errors += 1
+        minute = int(time.time() // 60)
+        bucket = self.series.setdefault(minute, [0, 0, 0])
+        bucket[0] += 1
+        bucket[1] += nbytes
+        if status >= 500:
+            bucket[2] += 1
+        cutoff = minute - 180
+        for old in [m for m in self.series if m < cutoff]:
+            del self.series[old]
+
+    def series_snapshot(self, minutes: int = 60) -> list:
+        now_minute = int(time.time() // 60)
+        out = []
+        for m in range(now_minute - minutes + 1, now_minute + 1):
+            r, b, e = self.series.get(m, (0, 0, 0))
+            out.append({"t": m * 60, "requests": r, "bytes": b,
+                        "errors": e})
+        return out
 
     def snapshot(self) -> dict:
         return {
@@ -475,6 +590,7 @@ class Stats:
             "by_status": dict(self.by_status),
             "top_hosts": self.by_host.most_common(10),
             "recent": list(self.recent),
+            "series": self.series_snapshot(),
             "watch": self.watch_snapshot(),
         }
 
@@ -705,6 +821,7 @@ class Proxy:
         status = 0
         detail: dict = {}
         sent = [0]
+        received = [0]
         try:
             raw = await asyncio.wait_for(read_head(reader), self.cfg.timeout)
             if raw is None:
@@ -873,6 +990,36 @@ class Proxy:
                 status = 200
                 return
 
+            if target.startswith("/__intercept/body") or \
+                    target.startswith("/__intercept/edit"):
+                if not await self._require_dashboard(writer, headers,
+                                                     api=True):
+                    status = 401
+                    return
+                q = parse_qs(urlsplit(target).query)
+                try:
+                    item_id = int(q.get("id", ["0"])[0])
+                except ValueError:
+                    item_id = 0
+                if target.startswith("/__intercept/edit"):
+                    body_bytes = await self._read_body(reader, headers, rest)
+                    try:
+                        form = json.loads(
+                            body_bytes.decode("utf-8", "replace"))
+                        result = self.edit_intercept(
+                            item_id, str(form.get("text", "")))
+                    except Exception as exc:
+                        result = {"ok": False, "error": f"bad request: {exc!r}"}
+                else:
+                    result = self.intercept_body(item_id)
+                body = json.dumps(result).encode()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                             b"Content-Length: " + str(len(body)).encode() +
+                             b"\r\nConnection: close\r\n\r\n" + body)
+                await writer.drain()
+                status = 200
+                return
+
             if target in ("/__stats", "/stats"):
                 if not await self._require_dashboard(writer, headers,
                                                      api=True):
@@ -959,18 +1106,20 @@ class Proxy:
                 host = target
                 if self._mitm_enabled_for(target):
                     status = await self._mitm(reader, writer, target,
-                                              sent, detail)
+                                              sent, detail, received)
                 else:
-                    status = await self._tunnel(reader, writer, target, sent)
+                    status = await self._tunnel(reader, writer, target, sent,
+                                                received)
             elif self.cfg.mode == "reverse":
                 host = self.cfg.upstream
                 status = await self._forward(reader, writer, first, headers,
                                              rest, self.cfg.upstream, target, sent,
-                                             detail)
+                                             detail, received=received)
             else:
                 host = urlsplit(target).netloc or headers.get("host", "-")
                 status = await self._forward(reader, writer, first, headers,
-                                             rest, None, target, sent, detail)
+                                             rest, None, target, sent, detail,
+                                             received=received)
         except Exception as exc:  # keep the server alive on any client error
             status = status or 502
             try:
@@ -984,9 +1133,11 @@ class Proxy:
             dur = int((time.monotonic() - start) * 1000)
             self.stats.record(host, status, sent[0])
             self.stats.record_event(time.strftime("%H:%M:%S"), method, host,
-                                    status, sent[0], dur,
+                                    status, sent[0] + received[0], dur,
                                     peer=str(peer), target=str(target),
-                                    payload=detail.get("payload"))
+                                    payload=detail.get("payload"),
+                                    bytes_up=sent[0],
+                                    bytes_down=received[0])
             if self.cfg.log_format == "json":
                 line = json.dumps({"peer": str(peer), "method": method,
                                    "host": host, "status": status,
@@ -1005,13 +1156,15 @@ class Proxy:
             except Exception:
                 pass
 
-    async def _tunnel(self, reader, writer, target: str, sent: list[int]) -> int:
+    async def _tunnel(self, reader, writer, target: str, sent: list[int],
+                      received: list[int] | None = None) -> int:
         host, _, port = target.partition(":")
         up_reader, up_writer = await asyncio.wait_for(
             asyncio.open_connection(host, int(port or 443)), self.cfg.timeout)
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
-        received = [0]
+        if received is None:
+            received = [0]
         await asyncio.gather(
             pipe(reader, up_writer, sent),
             pipe(up_reader, writer, received),
@@ -1042,7 +1195,7 @@ class Proxy:
         return self._maybe_ca()
 
     async def _mitm(self, reader, writer, target: str, sent: list[int],
-                    detail: dict) -> int:
+                    detail: dict, received: list[int] | None = None) -> int:
         """Terminate TLS for one allowlisted host, then treat the
         decrypted stream as plain HTTP (capture / intercept apply).
 
@@ -1119,7 +1272,8 @@ class Proxy:
                     new_reader, tls_writer, first, headers, rest, None,
                     abs_target, sent, req_detail,
                     up_streams=(up_reader, up_writer),
-                    close_client=False, default_port=443)
+                    close_client=False, default_port=443,
+                    received=received)
                 if req_detail.get("payload"):
                     detail["payload"] = req_detail["payload"]
                 if req_detail.get("response_framing") == "close" or \
@@ -1312,7 +1466,8 @@ class Proxy:
                 "restart_required_for": restart_only}
 
     def intercept_snapshot(self) -> list:
-        return [{k: v for k, v in item.items() if k != "event"}
+        return [{k: v for k, v in item.items()
+                 if k not in ("event", "body_raw")}
                 for item in self.intercepts.values()]
 
     def resolve_intercept(self, item_id: int, action: str) -> bool:
@@ -1323,13 +1478,57 @@ class Proxy:
         item["event"].set()
         return True
 
+    def intercept_body(self, item_id: int) -> dict:
+        """The editable text of a held body, for the dashboard editor."""
+        item = self.intercepts.get(item_id)
+        if not item:
+            return {"ok": False, "error": "not found"}
+        if not item.get("editable"):
+            return {"ok": False, "error": "body is not editable",
+                    "edit_mode": None}
+        return {"ok": True, "edit_mode": item["edit_mode"],
+                "edit_text": item["edit_text"],
+                "edited": item.get("edited", False)}
+
+    def edit_intercept(self, item_id: int, text: str) -> dict:
+        """Replace a held body with edited text.
+
+        Plain-text bodies are re-encoded as UTF-8. LGEB bodies are
+        re-encrypted with the same salt/contentHash/resVersion
+        derivation they were decrypted with, so the peer receives a
+        valid LGEB body of the new content.
+        """
+        item = self.intercepts.get(item_id)
+        if not item:
+            return {"ok": False, "error": "not found"}
+        if not item.get("editable"):
+            return {"ok": False, "error": "body is not editable"}
+        plain = text.encode("utf-8")
+        if item["edit_mode"] == "lgeb":
+            new_body = lgeb_encrypt_raw(
+                plain, self.cfg.payload_lgeb_salt_hex,
+                item["lgeb_content_hash"], item["lgeb_res_version"])
+            if new_body is None:
+                return {"ok": False, "error": "LGEB re-encrypt failed "
+                        "(salt missing or cryptography unavailable)"}
+        else:
+            new_body = plain
+        item["body_raw"] = new_body
+        item["edit_text"] = text
+        item["edited"] = True
+        item["body"] = preview_bytes(new_body, self.cfg.payload_max_bytes)
+        return {"ok": True, "id": item_id, "size": len(new_body),
+                "edited": True}
+
     async def _hold(self, phase: str, method: str, host: str,
-                    target: str, body: bytes) -> bool:
+                    target: str, body: bytes,
+                    editable: bool = True) -> bytes | None:
         """Park one phase of a connection until released/dropped/timeout.
 
-        Returns True to let it continue, False to drop it. Timeout
-        forwards (True) so a forgotten dashboard tab cannot wedge
-        the operator's own traffic forever.
+        Returns the body to forward (possibly edited from the
+        dashboard), or None to drop it. Timeout forwards the current
+        body so a forgotten dashboard tab cannot wedge the operator's
+        own traffic forever.
         """
         self._intercept_seq += 1
         item_id = self._intercept_seq
@@ -1340,16 +1539,44 @@ class Proxy:
             "body": preview_bytes(body, self.cfg.payload_max_bytes)
             if body else None,
             "action": "pending", "event": event,
+            "body_raw": body, "edited": False,
+            "editable": False, "edit_mode": None, "edit_text": None,
         }
+        if editable and body and len(body) <= 512_000:
+            opened = None
+            if body[:4] == b"LGEB" and self.cfg.payload_lgeb:
+                chash = self.cfg.payload_lgeb_content_hash or \
+                    extract_content_hash(target)
+                dec = lgeb_decrypt_raw(
+                    body, self.cfg.payload_lgeb_salt_hex, chash)
+                if dec is not None:
+                    plain, res_version = dec
+                    pv = preview_bytes(plain, len(plain) or 1)
+                    if pv["kind"] == "text":
+                        opened = ("lgeb", plain.decode("utf-8"),
+                                  chash, res_version)
+            if opened is None:
+                pv = preview_bytes(body, len(body) or 1)
+                if pv["kind"] == "text":
+                    opened = ("text", body.decode("utf-8"), None, None)
+            if opened is not None:
+                item["editable"] = True
+                item["edit_mode"] = opened[0]
+                item["edit_text"] = opened[1]
+                if opened[0] == "lgeb":
+                    item["lgeb_content_hash"] = opened[2]
+                    item["lgeb_res_version"] = opened[3]
         self.intercepts[item_id] = item
         try:
             await asyncio.wait_for(event.wait(),
                                    self.cfg.intercept_timeout)
         except asyncio.TimeoutError:
-            return True
+            pass
         finally:
             self.intercepts.pop(item_id, None)
-        return item["action"] != "drop"
+        if item["action"] == "drop":
+            return None
+        return item["body_raw"]
 
     def _capture_enabled_for(self, host: str) -> bool:
         if not self.cfg.payload_capture:
@@ -1362,7 +1589,7 @@ class Proxy:
     async def _forward(self, reader, writer, first, headers, rest,
                        upstream_base, target, sent, detail=None,
                        up_streams=None, close_client=True,
-                       default_port=80) -> int:
+                       default_port=80, received=None) -> int:
         if upstream_base:
             base = urlsplit(upstream_base)
             host, port = base.hostname, base.port or 80
@@ -1400,12 +1627,14 @@ class Proxy:
         # Intercept (transfer): hold the request before it reaches A.
         if intercept:
             method = first.split(" ")[0]
-            if not await self._hold("request", method, host, target,
-                                    req_body):
+            held = await self._hold("request", method, host, target,
+                                    req_body)
+            if held is None:
                 writer.write(b"HTTP/1.1 403 Forbidden\r\n"
                              b"Content-Length: 0\r\nConnection: close\r\n\r\n")
                 await writer.drain()
                 return 403
+            req_body = held
 
         cache_key = None
         if first.split(" ")[0].upper() == "GET":
@@ -1415,6 +1644,8 @@ class Proxy:
                 self.stats.cache_hits += 1
                 writer.write(hit)
                 await writer.drain()
+                if received is not None:
+                    received[0] += len(hit)
                 line = hit.split(b"\r\n", 1)[0].decode("iso-8859-1", "replace")
                 pp = line.split(" ")
                 return int(pp[1]) if len(pp) >= 2 and pp[1].isdigit() else 200
@@ -1434,6 +1665,8 @@ class Proxy:
                 continue
             if k == "host":
                 seen_host = True
+            if k == "content-length":
+                v = str(len(req_body))  # an intercept edit may resize it
             raw_headers.append(f"{k}: {v}")
         if not seen_host:
             raw_headers.append(f"host: {host}")
@@ -1476,6 +1709,8 @@ class Proxy:
                     pass
 
         response = b"".join(chunks)
+        if received is not None:
+            received[0] += total
         if detail is not None:
             resp_head = response.partition(b"\r\n\r\n")[0].lower()
             if b"content-length:" in resp_head or \
@@ -1485,10 +1720,24 @@ class Proxy:
                 detail["response_framing"] = "close"
 
         # Intercept (receive): hold the response before it reaches the client.
+        resp_edited = False
         if intercept:
-            resp_body = response.partition(b"\r\n\r\n")[2]
+            resp_head_b, _, resp_body = response.partition(b"\r\n\r\n")
+            chunked = b"transfer-encoding: chunked" in resp_head_b.lower()
             method = first.split(" ")[0]
-            if await self._hold("response", method, host, target, resp_body):
+            held = await self._hold("response", method, host, target,
+                                    resp_body, editable=not chunked)
+            if held is not None:
+                if held != resp_body:
+                    resp_edited = True
+                    lines = resp_head_b.decode(
+                        "iso-8859-1", "replace").split("\r\n")
+                    lines = [
+                        f"Content-Length: {len(held)}"
+                        if ln.lower().startswith("content-length:") else ln
+                        for ln in lines]
+                    response = "\r\n".join(lines).encode(
+                        "iso-8859-1") + b"\r\n\r\n" + held
                 try:
                     writer.write(response)
                     await writer.drain()
@@ -1502,16 +1751,26 @@ class Proxy:
                     await writer.drain()
                 except Exception:
                     pass
-        if cache_key and status == 200 and total <= self.cfg.cache_max_bytes:
+        if cache_key and status == 200 and total <= self.cfg.cache_max_bytes \
+                and not resp_edited:
             self.cache.put(cache_key, response)
 
         if capture and detail is not None:
             resp_body = response.partition(b"\r\n\r\n")[2]
+            req_head_text = "\r\n".join(
+                [first] + [f"{k}: {v}" for k, v in headers.items()])
+            resp_head_text = response.partition(b"\r\n\r\n")[0].decode(
+                "iso-8859-1", "replace")
             payload = {
-                "request": preview_bytes(req_body, self.cfg.payload_max_bytes)
+                "request": preview_body(req_body, self.cfg.payload_max_bytes)
                 if req_body else None,
-                "response": preview_bytes(resp_body, self.cfg.payload_max_bytes)
+                "response": preview_body(resp_body, self.cfg.payload_max_bytes)
                 if resp_body else None,
+                "request_headers": preview_bytes(
+                    req_head_text.encode("utf-8", "replace"), 2048),
+                "response_headers": preview_bytes(
+                    resp_head_text.encode("iso-8859-1", "replace"), 2048)
+                if resp_head_text else None,
             }
             dec_req = try_aes_decrypt(req_body, self.cfg.payload_aes_key,
                                       self.cfg.payload_aes_iv) if req_body else None
@@ -1541,6 +1800,10 @@ LOGIN_HTML = """<!DOCTYPE html>
 <html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Login Dashboard proxy-server</title>
+<script>try{document.documentElement.dataset.theme=
+(JSON.parse(localStorage.getItem('ps_prefs')||'{}').theme==='dark')
+?'dark':'light'}catch(e){document.documentElement.dataset.theme='light'}
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1552,6 +1815,11 @@ LOGIN_HTML = """<!DOCTYPE html>
 --color-destructive:#DC2626;
 --font-heading:"Plus Jakarta Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
 --font-body:"Plus Jakarta Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+:root[data-theme="dark"]{--color-accent:#818CF8;
+--color-on-accent:#0B1020;--color-background:#0C1222;
+--color-foreground:#E8EDF7;--color-card:#151C2E;
+--color-muted-foreground:#94A3B8;--color-border:#3B4A6B;
+--color-secondary:#26314A;--color-destructive:#F87171;color-scheme:dark}
 *{box-sizing:border-box}
 body{font-family:var(--font-body);margin:0;min-height:100vh;
 background:var(--color-background);color:var(--color-foreground);
@@ -1577,6 +1845,9 @@ font-weight:700;border-radius:8px;padding:11px;font-size:14.5px;cursor:pointer}
 button:hover{opacity:.92}
 .error{background:rgba(220,38,38,.06);border:1px solid var(--color-destructive);
 color:#B91C1C;border-radius:8px;padding:10px 13px;font-size:13.5px}
+:root[data-theme="dark"] .error{color:#FCA5A5;
+background:rgba(220,38,38,.13)}
+:root[data-theme="dark"] .login-card{box-shadow:0 12px 32px rgba(0,0,0,.5)}
 .note{color:var(--color-muted-foreground);font-size:12.5px;margin-top:16px}
 code{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px}
 </style></head><body>
@@ -1626,6 +1897,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dashboard proxy-server</title>
+<script>try{document.documentElement.dataset.theme=
+(JSON.parse(localStorage.getItem('ps_prefs')||'{}').theme==='dark')
+?'dark':'light'}catch(e){document.documentElement.dataset.theme='light'}
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1852,6 +2127,24 @@ ol.steps li{margin:5px 0}
 .phase{font-weight:700}
 .watchname{color:var(--color-accent);font-weight:700}
 .sr{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+/* ---------- dark theme ---------- */
+:root[data-theme="dark"]{--color-primary:#151C2E;
+--color-secondary:#26314A;--color-accent:#818CF8;
+--color-on-accent:#0B1020;--color-background:#0C1222;
+--color-foreground:#E8EDF7;--color-card:#151C2E;
+--color-muted:#1D2740;--color-muted-foreground:#94A3B8;
+--color-border:#3B4A6B;--color-destructive:#F87171;
+--ok:#4ADE80;--warn:#FBBF24;--info:#38BDF8;
+--shadow-sm:0 1px 2px rgba(0,0,0,.4),0 1px 3px rgba(0,0,0,.35);
+color-scheme:dark}
+:root[data-theme="dark"] .topbar{background:rgba(12,18,34,.92)}
+:root[data-theme="dark"] .errbar{color:#FCA5A5;
+background:rgba(220,38,38,.13)}
+:root[data-theme="dark"] .drawer{box-shadow:-18px 0 40px rgba(0,0,0,.5)}
+:root[data-theme="dark"] .modal{box-shadow:0 24px 48px rgba(0,0,0,.55)}
+:root[data-theme="dark"] .toast{box-shadow:0 12px 28px rgba(0,0,0,.45)}
+:root[data-theme="dark"] .dropdown{box-shadow:0 16px 32px rgba(0,0,0,.45)}
+button.danger-btn{background:#DC2626;border-color:#DC2626;color:#FFFFFF}
 /* ---------- detail drawer (right slide-over) ---------- */
 .drawer-scrim{position:fixed;inset:0;z-index:55;background:rgba(2,6,16,.55)}
 .drawer-scrim[hidden]{display:none}
@@ -1886,8 +2179,7 @@ to{opacity:1;transform:none}}
 .modal .mbody{overflow-y:auto;color:var(--color-foreground)}
 .modal .mbody pre{max-height:50vh}
 .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
-button.danger-btn{background:var(--color-destructive);
-border-color:var(--color-destructive);color:#fff;font-weight:600}
+button.danger-btn{font-weight:600}
 /* ---------- toasts ---------- */
 .toast-stack{position:fixed;top:14px;right:14px;z-index:80;display:flex;
 flex-direction:column;gap:8px;width:min(360px,calc(100vw - 28px))}
@@ -1900,6 +2192,53 @@ box-shadow:0 12px 28px rgba(15,23,42,.16);animation:toastIn 200ms ease}
 .toast span{flex:1}
 @keyframes toastIn{from{opacity:0;transform:translateX(14px)}
 to{opacity:1;transform:none}}
+/* ---------- traffic chart ---------- */
+.chart-head{display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+margin-bottom:10px}
+.chart-toggle{display:flex;gap:6px;flex-wrap:wrap}
+.chart svg{display:block;width:100%;height:auto}
+.chart .grid{stroke:var(--color-secondary);stroke-width:1}
+.chart .area{fill:var(--color-accent);opacity:.13}
+.chart .line{fill:none;stroke:var(--color-accent);stroke-width:2;
+stroke-linejoin:round;stroke-linecap:round}
+.chart .dot{fill:var(--color-accent)}
+.chart text{fill:var(--color-muted-foreground);font-size:10.5px;
+font-family:var(--font-body)}
+/* ---------- pager + sortable + prefs ---------- */
+.pager{display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+margin-top:12px}
+.pager label{display:flex;gap:8px;align-items:center;font-size:13px;
+color:var(--color-muted-foreground)}
+.pager-btns{margin-left:auto;display:flex;gap:8px}
+.pager button:disabled{opacity:.45;cursor:default}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--color-accent)}
+th.sortable .dir{font-size:10px;margin-left:4px;color:var(--color-accent)}
+.prow{display:flex;gap:20px;flex-wrap:wrap;align-items:end}
+.prow>label{display:flex;flex-direction:column;gap:5px;font-size:13px;
+color:var(--color-muted-foreground)}
+.prow>label.check{flex-direction:row;align-items:center;gap:8px;
+color:var(--color-foreground);padding-bottom:9px}
+/* ---------- custom selects (no native dropdown look) ---------- */
+select{appearance:none;-webkit-appearance:none;cursor:pointer;
+background-color:var(--color-card);
+background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748B' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+background-repeat:no-repeat;background-position:right 10px center;
+border:1px solid var(--color-border);color:var(--color-foreground);
+border-radius:9px;padding:9px 32px 9px 12px;font:inherit;
+font-size:13.5px;min-height:42px;
+transition:border-color 140ms ease,box-shadow 140ms ease}
+select:hover{border-color:var(--color-accent)}
+select:focus{border-color:var(--color-accent);outline:none;
+box-shadow:0 0 0 3px rgba(79,70,229,.18)}
+.prow>label select{min-width:172px}
+textarea{width:100%;background:var(--color-card);
+border:1px solid var(--color-border);color:var(--color-foreground);
+border-radius:9px;padding:10px 12px;font-family:var(--font-mono);
+font-size:12.5px;line-height:1.5;resize:vertical}
+textarea:focus{border-color:var(--color-accent);outline:none;
+box-shadow:0 0 0 3px rgba(79,70,229,.18)}
+.pager select{min-height:36px;padding:6px 30px 6px 10px;font-size:13px}
 /* ---------- alert + skeleton ---------- */
 .errbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 .errbar span{flex:1;min-width:220px}
@@ -1951,55 +2290,44 @@ margin:0}
     </div>
     <nav aria-label="Menu utama">
       <div class="navgroup">
-        <div class="navlabel">Menu utama</div>
+        <div class="navlabel" data-i18n="nav.main">Menu utama</div>
         <a class="navlink" href="#/ringkasan" data-view="ringkasan">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-          <span class="label">Dashboard</span></a>
+          <span class="label" data-i18n="nav.dashboard">Dashboard</span></a>
         <a class="navlink" href="#/lalu-lintas" data-view="lalu-lintas">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h12M12 3l4 4-4 4M20 17H8M12 13l-4 4 4 4"/></svg>
-          <span class="label">Lalu lintas</span></a>
+          <span class="label" data-i18n="nav.traffic">Lalu lintas</span></a>
         <a class="navlink" href="#/ditahan" data-view="ditahan">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
-          <span class="label">Ditahan</span> <span class="badge" id="interceptBadge" hidden>0</span></a>
+          <span class="label" data-i18n="nav.held">Ditahan</span> <span class="badge" id="interceptBadge" hidden>0</span></a>
       </div>
       <div class="navgroup">
-        <div class="navlabel">Konfigurasi</div>
+        <div class="navlabel" data-i18n="nav.config">Konfigurasi</div>
         <a class="navlink" href="#/https" data-view="https">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
           <span class="label">HTTPS / MITM</span></a>
         <a class="navlink" href="#/pengaturan" data-view="pengaturan">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 8h9M19 8h1M4 16h3M13 16h7"/><circle cx="16" cy="8" r="2.2"/><circle cx="10" cy="16" r="2.2"/></svg>
-          <span class="label">Pengaturan</span></a>
+          <span class="label" data-i18n="nav.settings">Pengaturan</span></a>
       </div>
       <div class="navgroup">
-        <div class="navlabel">Sistem</div>
+        <div class="navlabel" data-i18n="nav.system">Sistem</div>
         <a class="navlink" href="/__stats">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 19V10M10 19V5M16 19v-8M22 19H2"/></svg>
-          <span class="label">Statistik JSON</span></a>
+          <span class="label" data-i18n="nav.statsjson">Statistik JSON</span></a>
         <a class="navlink" href="/__health">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg>
-          <span class="label">Status server</span></a>
+          <span class="label" data-i18n="nav.health">Status server</span></a>
         <a class="navlink" href="/__ca">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="8" cy="14" r="4.5"/><path d="M11.5 10.5 20 2M17 5l3 3M14 8l2.5 2.5"/></svg>
-          <span class="label">Sertifikat CA</span></a>
+          <span class="label" data-i18n="nav.ca">Sertifikat CA</span></a>
         <a class="navlink" href="/proxy.pac">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18.5h2"/></svg>
-          <span class="label">File PAC (HP)</span></a>
+          <span class="label" data-i18n="nav.pac">File PAC (HP)</span></a>
       </div>
     </nav>
     <div class="sidefoot">
-      <div class="usercard">
-        <div class="avatar" id="sidebarAvatar" aria-hidden="true">OP</div>
-        <div class="meta">
-          <b id="sidebarUserName">Operator</b>
-          <span id="sidebarUserRole">Administrator</span>
-        </div>
-        <button type="button" class="iconbtn" id="sidebarLogoutBtn"
-          title="Keluar" aria-label="Keluar">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M14 4h-6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6M10 12h11M18 8l3 4-3 4"/></svg>
-        </button>
-      </div>
-      <div class="sidever">proxy-server v0.9.5 · Admin Console</div>
+      <div class="sidever">proxy-server v0.10.0 · Admin Console</div>
     </div>
   </aside>
   <div class="scrim" id="sidebarScrim" hidden></div>
@@ -2014,19 +2342,14 @@ margin:0}
         <div>
           <div class="crumb">Admin / <span id="crumbView">Dashboard</span></div>
           <h1 id="viewTitle">Dashboard</h1>
-          <div class="sub" id="viewSub">Keadaan proxy saat ini, sekilas.</div>
         </div>
       </div>
       <div class="headctl">
         <div class="globalsearch">
-          <label class="sr" for="globalSearch">Cari host di lalu lintas</label>
+          <label class="sr" for="globalSearch" data-i18n="a11y.globalsearch">Cari host di lalu lintas</label>
           <input id="globalSearch" type="search"
-            placeholder="Cari host, tekan Enter…">
+            data-i18n-ph="ph.globalsearch" placeholder="Cari host, tekan Enter…">
         </div>
-        <span id="livePill" class="live ok"><span class="sq" aria-hidden="true"></span><span id="liveText">Live, menyegarkan tiap 2 detik</span></span>
-        <label class="check"><input type="checkbox" id="autoRefresh" checked>
-        <span>Segarkan otomatis</span></label>
-        <button type="button" id="btnRefresh">Segarkan</button>
         <div class="usermenu">
           <button type="button" class="userbtn" id="userMenuBtn"
             aria-haspopup="true" aria-expanded="false">
@@ -2037,9 +2360,9 @@ margin:0}
           </button>
           <div class="dropdown" id="userDropdown" hidden>
             <div class="dhead"><b id="ddUserName">Operator</b>
-            <span id="sessionState">Memuat sesi…</span></div>
-            <a href="#/pengaturan">Pengaturan</a>
-            <a href="/__login">Halaman login</a>
+            <span id="sessionState" data-i18n="user.loading">Memuat sesi…</span></div>
+            <a href="#/pengaturan" data-i18n="nav.settings">Pengaturan</a>
+            <a href="/__login" data-i18n="user.loginpage">Halaman login</a>
             <button type="button" class="dditem" id="logoutBtn">Keluar</button>
           </div>
         </div>
@@ -2048,9 +2371,8 @@ margin:0}
 
     <main>
       <div id="errbar" class="errbar" role="alert" hidden>
-        <span>Tidak bisa menghubungi server. Yang tampil adalah data
-        terakhir yang berhasil dimuat.</span>
-        <button type="button" id="btnRetry">Coba lagi</button>
+        <span data-i18n="alert.offline">Tidak bisa menghubungi server. Yang tampil adalah data terakhir yang berhasil dimuat.</span>
+        <button type="button" id="btnRetry" data-i18n="btn.retry">Coba lagi</button>
       </div>
 
       <section class="view" id="view-ringkasan" aria-label="Ringkasan">
@@ -2062,23 +2384,36 @@ margin:0}
         <div class="quick-grid" aria-label="Aksi cepat">
           <a class="quick-card" href="#/lalu-lintas">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h12M12 3l4 4-4 4M20 17H8M12 13l-4 4 4 4"/></svg>
-            <span><b>Lihat lalu lintas</b>
-            <span>Semua koneksi dan detail payload.</span></span></a>
+            <span><b data-i18n="quick.traffic.t">Lihat lalu lintas</b>
+            <span data-i18n="quick.traffic.d">Semua koneksi dan detail payload.</span></span></a>
           <a class="quick-card" href="#/ditahan">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
-            <span><b>Periksa yang ditahan</b>
-            <span>Teruskan atau tolak intercept.</span></span></a>
+            <span><b data-i18n="quick.held.t">Periksa yang ditahan</b>
+            <span data-i18n="quick.held.d">Teruskan atau tolak intercept.</span></span></a>
           <a class="quick-card" href="#/https">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
-            <span><b>Atur HTTPS / MITM</b>
-            <span>CA dan host yang diakhiri TLS-nya.</span></span></a>
+            <span><b data-i18n="quick.https.t">Atur HTTPS / MITM</b>
+            <span data-i18n="quick.https.d">CA dan host yang diakhiri TLS-nya.</span></span></a>
           <a class="quick-card" href="#/pengaturan">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 8h9M19 8h1M4 16h3M13 16h7"/><circle cx="16" cy="8" r="2.2"/><circle cx="10" cy="16" r="2.2"/></svg>
-            <span><b>Buka pengaturan</b>
-            <span>Capture, intercept, PAC, dan batas.</span></span></a>
+            <span><b data-i18n="quick.settings.t">Buka pengaturan</b>
+            <span data-i18n="quick.settings.d">Capture, intercept, PAC, dan batas.</span></span></a>
         </div>
 
-        <h2>Lalu lintas terakhir</h2>
+        <h2 data-i18n="chart.title">Grafik trafik</h2>
+        <div class="panel">
+          <div class="chart-head">
+            <div class="chart-toggle" role="group" aria-label="Metrik grafik">
+              <button type="button" class="chip on" data-cm="requests" data-i18n="chart.requests">Request</button>
+              <button type="button" class="chip" data-cm="bytes" data-i18n="chart.bytes">Data</button>
+              <button type="button" class="chip" data-cm="errors" data-i18n="chart.errors">Error</button>
+            </div>
+            <span class="muted small" id="chartMeta"></span>
+          </div>
+          <div id="trafficChart" class="chart"></div>
+        </div>
+
+        <h2 data-i18n="dash.recent">Lalu lintas terakhir</h2>
         <div class="panel flush">
           <table id="recentMini">
             <thead><tr><th>Waktu</th><th>Method</th><th>Host</th>
@@ -2086,50 +2421,63 @@ margin:0}
             <tbody></tbody>
           </table>
         </div>
-        <p><a class="btn" href="#/lalu-lintas">Lihat semua lalu lintas</a></p>
+        <p><a class="btn" href="#/lalu-lintas" data-i18n="dash.alltraffic">Lihat semua lalu lintas</a></p>
 
         <div class="grid2">
           <div>
-            <h2>Host yang dipantau</h2>
+            <h2 data-i18n="dash.watch">Host yang dipantau</h2>
             <div class="panel">
-              <div id="watch"><p class="muted">Tidak ada watchlist. Jalankan
-              dengan <code>--lumi</code> atau <code>--watch HOST</code>.</p></div>
+              <div id="watch"><p class="muted" data-i18n-html="watch.none">Tidak ada watchlist. Jalankan dengan <code>--lumi</code> atau <code>--watch HOST</code>.</p></div>
               <table id="watchTable"></table>
-              <h3 class="small" style="margin:14px 0 4px">Host tersibuk</h3>
+              <h3 class="small" style="margin:14px 0 4px" data-i18n="dash.top">Host tersibuk</h3>
               <table id="tops"></table>
             </div>
           </div>
           <div>
-            <h2>Sambungkan HP (PAC)</h2>
+            <h2 data-i18n="dash.pac">Sambungkan HP (PAC)</h2>
             <div class="panel">
-              <label for="pacUrl"><b>URL PAC untuk Wi-Fi HP</b></label>
-              <p class="help muted small">Di pengaturan Wi-Fi HP pilih proxy
-              &ldquo;Auto&rdquo; lalu tempel URL ini. Hanya host di daftar
-              PAC yang lewat proxy ini; sisanya langsung.</p>
+              <label for="pacUrl"><b data-i18n="pac.label">URL PAC untuk Wi-Fi HP</b></label>
+              <p class="help muted small" data-i18n="pac.help">Di pengaturan Wi-Fi HP pilih proxy Auto lalu tempel URL ini. Hanya host di daftar PAC yang lewat proxy ini; sisanya langsung.</p>
               <input id="pacUrl" type="text" readonly value="">
-              <p><button type="button" id="btnCopyPac">Salin URL PAC</button>
+              <p><button type="button" id="btnCopyPac" data-i18n="pac.copy">Salin URL PAC</button>
               <span id="pacMsg" class="muted small"></span></p>
-              <p class="muted small">Atau proxy &ldquo;Manual&rdquo;: host =
-              alamat proxy ini, port = port-nya. Manual mengarahkan semua
-              trafik HP lewat sini.</p>
+              <p class="muted small" data-i18n="pac.manual">Atau proxy Manual: host = alamat proxy ini, port = port-nya. Manual mengarahkan semua trafik HP lewat sini.</p>
             </div>
           </div>
         </div>
       </section>
 
       <section class="view" id="view-lalu-lintas" aria-label="Lalu lintas">
-        <p class="lede">Payload hanya tampil untuk host milikmu yang ada di
-        daftar capture; koneksi lain hanya metadata (host, status, ukuran,
-        durasi). Klik baris untuk detailnya.</p>
+        <p class="lede" data-i18n-html="traffic.lede">Payload hanya tampil untuk host milikmu yang ada di daftar capture; koneksi lain hanya metadata (host, status, ukuran, durasi). Klik baris untuk detailnya.</p>
         <div class="toolbar">
           <label class="sr" for="q">Cari berdasarkan host, method, atau status</label>
-          <input id="q" type="search" placeholder="Cari host / method / status…">
+          <input id="q" type="search" data-i18n-ph="ph.q" placeholder="Cari host / method / status…">
           <div role="group" aria-label="Filter cepat">
-            <button type="button" class="chip on" data-f="all">Semua</button>
-            <button type="button" class="chip" data-f="watched">Dipantau</button>
-            <button type="button" class="chip" data-f="errors">Error saja</button>
+            <button type="button" class="chip on" data-f="all" data-i18n="chip.all">Semua</button>
+            <button type="button" class="chip" data-f="watched" data-i18n="chip.watched">Dipantau</button>
+            <button type="button" class="chip" data-f="errors" data-i18n="chip.errors">Error saja</button>
             <button type="button" class="chip" data-f="connect">CONNECT</button>
           </div>
+          <label class="sr" for="fStatus">Filter status</label>
+          <select id="fStatus">
+            <option value="" data-i18n="flt.allstatus">Semua status</option>
+            <option value="2">2xx</option>
+            <option value="3">3xx</option>
+            <option value="4">4xx</option>
+            <option value="5">5xx</option>
+          </select>
+          <label class="sr" for="fMethod">Filter metode</label>
+          <select id="fMethod">
+            <option value="" data-i18n="flt.allmethod">Semua metode</option>
+            <option>GET</option>
+            <option>POST</option>
+            <option>PUT</option>
+            <option>PATCH</option>
+            <option>DELETE</option>
+            <option>HEAD</option>
+            <option>OPTIONS</option>
+            <option>CONNECT</option>
+          </select>
         </div>
         <div class="panel flush">
           <div class="tscroll"><table id="recent">
@@ -2138,36 +2486,67 @@ margin:0}
             <tbody></tbody>
           </table></div>
         </div>
-        <p id="recentEmpty" class="muted" hidden>Belum ada lalu lintas yang
-        cocok dengan filter ini. Arahkan HP ke proxy ini lalu buka sesuatu,
-        atau longgarkan filternya.</p>
+        <div class="pager">
+          <label><span data-i18n="page.per">Baris per halaman</span>
+            <select id="pageSize">
+              <option value="10">10</option>
+              <option value="25" selected>25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select></label>
+          <span id="pageInfo" class="muted small"></span>
+          <span class="pager-btns">
+            <button type="button" id="pagePrev" data-i18n="page.prev">Sebelumnya</button>
+            <button type="button" id="pageNext" data-i18n="page.next">Berikutnya</button>
+          </span>
+        </div>
+        <p id="recentEmpty" class="muted" hidden data-i18n="recent.empty">Belum ada lalu lintas yang cocok dengan filter ini. Arahkan HP ke proxy ini lalu buka sesuatu, atau longgarkan filternya.</p>
       </section>
 
       <section class="view" id="view-ditahan" aria-label="Ditahan">
-        <p class="lede">Request dan response untuk host di daftar intercept
-        berhenti di sini dulu. <b>Teruskan</b> = kirim seperti biasa.
-        <b>Tolak</b> = putuskan (request ditolak 403, response digagalkan
-        502). Lewat batas timeout, yang ditahan diteruskan otomatis.</p>
-        <div id="intercepts"><p class="muted">Tidak ada yang sedang ditahan.</p></div>
+        <p class="lede" data-i18n-html="held.lede">Request dan response untuk host di daftar intercept berhenti di sini dulu. <b>Teruskan</b> = kirim seperti biasa. <b>Tolak</b> = putuskan (request ditolak 403, response digagalkan 502). Lewat batas timeout, yang ditahan diteruskan otomatis.</p>
+        <div id="intercepts"><p class="muted" data-i18n="held.empty">Tidak ada yang sedang ditahan.</p></div>
       </section>
 
       <section class="view" id="view-https" aria-label="HTTPS MITM">
-        <p class="lede">Tanpa MITM, koneksi HTTPS hanya terlihat sebagai
-        terowongan CONNECT: host dan ukuran saja, isinya tidak. Dengan
-        MITM, proxy mengakhiri TLS untuk host milikmu memakai CA lokal
-        sehingga isinya terbaca seperti HTTP biasa.</p>
-        <div class="panel" id="mitmPanel"><p class="muted">Memuat status MITM…</p></div>
+        <p class="lede" data-i18n-html="https.lede">Tanpa MITM, koneksi HTTPS hanya terlihat sebagai terowongan CONNECT: host dan ukuran saja, isinya tidak. Dengan MITM, proxy mengakhiri TLS untuk host milikmu memakai CA lokal sehingga isinya terbaca seperti HTTP biasa.</p>
+        <div class="panel" id="mitmPanel"><p class="muted" data-i18n="mitm.loading">Memuat status MITM…</p></div>
       </section>
 
       <section class="view" id="view-pengaturan" aria-label="Pengaturan">
-        <div id="settingsForm"><p class="muted">Memuat pengaturan…</p></div>
+        <div class="panel" id="prefsPanel">
+          <h3 class="small" style="margin-top:0" data-i18n="prefs.title">Preferensi tampilan (browser ini)</h3>
+          <div class="prow">
+            <label class="check"><input type="checkbox" id="prefAutoRefresh" checked>
+              <span data-i18n="prefs.auto">Segarkan otomatis</span></label>
+            <label><span data-i18n="prefs.interval">Interval penyegaran</span>
+              <select id="prefInterval">
+                <option value="2">2</option>
+                <option value="5">5</option>
+                <option value="10">10</option>
+                <option value="30">30</option>
+              </select></label>
+            <label><span data-i18n="prefs.lang">Bahasa</span>
+              <select id="prefLang">
+                <option value="id">Bahasa Indonesia</option>
+                <option value="en">English</option>
+              </select></label>
+            <label><span data-i18n="prefs.theme">Tema</span>
+              <select id="prefTheme">
+                <option value="light" data-i18n="prefs.light">Terang</option>
+                <option value="dark" data-i18n="prefs.dark">Gelap</option>
+              </select></label>
+          </div>
+          <p class="muted small" data-i18n="prefs.note">Aturan refresh dan bahasa tersimpan di browser ini, bukan konfigurasi server.</p>
+        </div>
+        <div id="settingsForm"><p class="muted" data-i18n="set.loading">Memuat pengaturan…</p></div>
         <label class="check" style="margin-top:4px">
           <input type="checkbox" id="setPersist" checked>
-          <span>Simpan juga ke .env
-          <span class="help muted small" style="display:block">Kalau dicentang,
+          <span><span data-i18n="set.persist">Simpan juga ke .env</span>
+          <span class="help muted small" style="display:block" data-i18n="set.persist.help">Kalau dicentang,
           pilihan di sini tetap berlaku setelah server di-restart.</span></span>
         </label>
-        <p><button type="button" class="primary" id="btnSave">Simpan pengaturan</button>
+        <p><button type="button" class="primary" id="btnSave" data-i18n="set.save">Simpan pengaturan</button>
         <span id="settingsMsg" class="muted" role="status"></span></p>
       </section>
     </main>
@@ -2178,7 +2557,7 @@ margin:0}
 <aside class="drawer" id="detail" aria-label="Detail koneksi" hidden>
   <div class="drawer-head">
     <div>
-      <b>Detail koneksi</b> <span class="muted" id="detailId"></span>
+      <b data-i18n="detail.title">Detail koneksi</b> <span class="muted" id="detailId"></span>
       <div class="sub2" id="detailSub"></div>
     </div>
     <button type="button" class="iconbtn" id="btnCloseDetail"
@@ -2207,25 +2586,382 @@ margin:0}
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;')
   .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+/* ================= i18n + preferences ================= */
+const I18N = {
+id: {
+ 'nav.main':'Menu utama','nav.config':'Konfigurasi','nav.system':'Sistem',
+ 'nav.dashboard':'Dashboard','nav.traffic':'Lalu lintas','nav.held':'Ditahan',
+ 'nav.settings':'Pengaturan','nav.statsjson':'Statistik JSON',
+ 'nav.health':'Status server','nav.ca':'Sertifikat CA','nav.pac':'File PAC (HP)',
+ 'a11y.globalsearch':'Cari host di lalu lintas',
+ 'ph.globalsearch':'Cari host, tekan Enter…','ph.q':'Cari host / method / status…',
+ 'user.loginpage':'Halaman login','user.logout':'Keluar',
+ 'user.enablelogin':'Aktifkan login','user.role.admin':'Administrator',
+ 'user.role.nologin':'Mode tanpa login',
+ 'user.session.on':'Login aktif, sesi berlaku di browser ini',
+ 'user.session.off':'Login belum diaktifkan (DASHBOARD_AUTH kosong)',
+ 'user.loading':'Memuat sesi…',
+ 'alert.offline':'Tidak bisa menghubungi server. Yang tampil adalah data terakhir yang berhasil dimuat.',
+ 'btn.retry':'Coba lagi',
+ 'view.dashboard':'Dashboard','view.traffic':'Lalu lintas',
+ 'view.held':'Ditahan (intercept)','view.https':'HTTPS (MITM)',
+ 'view.settings':'Pengaturan',
+ 'quick.traffic.t':'Lihat lalu lintas','quick.traffic.d':'Semua koneksi dan detail payload.',
+ 'quick.held.t':'Periksa yang ditahan','quick.held.d':'Teruskan atau tolak intercept.',
+ 'quick.https.t':'Atur HTTPS / MITM','quick.https.d':'CA dan host yang diakhiri TLS-nya.',
+ 'quick.settings.t':'Buka pengaturan','quick.settings.d':'Capture, intercept, PAC, dan batas.',
+ 'chart.title':'Grafik trafik','chart.requests':'Request',
+ 'chart.bytes':'Data','chart.errors':'Error',
+ 'chart.meta':'Total 60 mnt: {total} · Puncak {peak}/mnt',
+ 'chart.empty':'Belum ada data grafik.',
+ 'dash.recent':'Lalu lintas terakhir','dash.alltraffic':'Lihat semua lalu lintas',
+ 'dash.watch':'Host yang dipantau','dash.top':'Host tersibuk',
+ 'dash.pac':'Sambungkan HP (PAC)',
+ 'pac.label':'URL PAC untuk Wi-Fi HP','pac.copy':'Salin URL PAC',
+ 'pac.help':'Di pengaturan Wi-Fi HP pilih proxy Auto lalu tempel URL ini. Hanya host di daftar PAC yang lewat proxy ini; sisanya langsung.',
+ 'pac.manual':'Atau proxy Manual: host = alamat proxy ini, port = port-nya. Manual mengarahkan semua trafik HP lewat sini.',
+ 'pac.copied':'URL PAC tersalin. Tempel di pengaturan Wi-Fi HP.',
+ 'pac.copied.msg':'Tersalin. Tempel di pengaturan Wi-Fi HP.',
+ 'th.time':'Waktu','th.method':'Method','th.host':'Host','th.status':'Status',
+ 'th.size':'Ukuran','th.duration':'Durasi','th.note':'Keterangan',
+ 'chip.all':'Semua','chip.watched':'Dipantau','chip.errors':'Error saja',
+ 'traffic.lede':'Payload hanya tampil untuk host milikmu yang ada di daftar capture; koneksi lain hanya metadata (host, status, ukuran, durasi). Klik baris untuk detailnya.',
+ 'page.per':'Baris per halaman','page.prev':'Sebelumnya','page.next':'Berikutnya',
+ 'page.info':'Halaman {a} dari {b} · {n} koneksi',
+ 'recent.empty':'Belum ada lalu lintas yang cocok dengan filter ini. Arahkan HP ke proxy ini lalu buka sesuatu, atau longgarkan filternya.',
+ 'recent.none':'Belum ada lalu lintas. Arahkan HP ke proxy ini lalu buka sesuatu.',
+ 'note.watched':'dipantau','note.payload':'payload ada',
+ 'held.lede':'Request dan response untuk host di daftar intercept berhenti di sini dulu. <b>Teruskan</b> = kirim seperti biasa. <b>Tolak</b> = putuskan (request ditolak 403, response digagalkan 502). Lewat batas timeout, yang ditahan diteruskan otomatis.',
+ 'held.empty':'Tidak ada yang sedang ditahan. Intercept hanya menahan host yang ada di daftar host intercept di Pengaturan.',
+ 'held.phase.request':'Request, dari klien ke server (keluar)',
+ 'held.phase.response':'Response, dari server ke klien (masuk)',
+ 'held.release':'Teruskan','held.drop':'Tolak',
+ 'held.edit':'Ubah body','held.save':'Simpan perubahan',
+ 'held.edited':'sudah diedit',
+ 'held.edit.lgeb':'Body LGEB: yang tampil adalah teks hasil dekripsi. Menyimpan akan mengenkripsi ulang otomatis dengan kunci yang sama.',
+ 'held.edit.text':'Sunting body sebagai teks. Isi baru diteruskan saat paket ini dilepas.',
+ 'held.saved':'Body intercept #{id} diperbarui.',
+ 'held.editfail':'Gagal menyimpan body intercept #{id}.',
+ 'toast.held.release':'Intercept #{id} diteruskan.',
+ 'toast.held.drop':'Intercept #{id} ditolak.',
+ 'toast.held.fail':'Gagal memproses intercept #{id}. Server tidak menjawab.',
+ 'modal.drop.title':'Tolak lalu lintas ini?',
+ 'modal.drop.body':'Request yang ditolak diputus dengan 403, response yang ditolak digagalkan dengan 502. Tindakan ini tidak bisa dibatalkan.',
+ 'modal.drop.confirm':'Ya, tolak','modal.cancel':'Batal','modal.yes':'Ya',
+ 'modal.close':'Tutup','modal.back':'Kembali',
+ 'https.lede':'Tanpa MITM, koneksi HTTPS hanya terlihat sebagai terowongan CONNECT: host dan ukuran saja, isinya tidak. Dengan MITM, proxy mengakhiri TLS untuk host milikmu memakai CA lokal sehingga isinya terbaca seperti HTTP biasa.',
+ 'mitm.loading':'Memuat status MITM…','mitm.status':'Status',
+ 'mitm.on':'Aktif','mitm.off':'Mati','mitm.ca.ready':'Siap',
+ 'mitm.ca.later':'Dibuat saat MITM pertama kali aktif',
+ 'mitm.ca.nocrypto':'Butuh paket cryptography di server',
+ 'mitm.hosts':'Host yang di-MITM','mitm.none':'(belum ada, isi di Pengaturan)',
+ 'mitm.verify':'Verifikasi sertifikat asli server tujuan',
+ 'mitm.yes':'ya','mitm.no':'tidak (MITM_VERIFY_UPSTREAM=0)',
+ 'mitm.fp':'Fingerprint SHA-256 CA, samakan dengan yang tampil di HP saat memasang sertifikat:',
+ 'mitm.download':'Unduh sertifikat CA (.crt)',
+ 'mitm.install':'Pasang di HP, sekali saja:',
+ 'mitm.step1':'Unduh file CA dari tombol di atas.',
+ 'mitm.step2':'<b>Android:</b> Pengaturan, Keamanan, Pasang sertifikat, Sertifikat CA, pilih file tadi.',
+ 'mitm.step3':'<b>iPhone:</b> buka file-nya untuk memasang profil, lalu Pengaturan, Umum, Tentang, Pengaturan Kepercayaan Sertifikat, aktifkan untuk CA ini.',
+ 'mitm.step4':'Nyalakan MITM di Pengaturan dan isi host server milikmu. Setelah itu, koneksi HTTPS ke host tersebut muncul sebagai request yang terbaca, bukan lagi CONNECT buta.',
+ 'mitm.pinning':'Aplikasi yang memakai certificate pinning tetap menolak sertifikat ini; untuk aplikasi milikmu, atur dari sisi aplikasinya. Yang diunduh hanya sertifikat publik CA. Kunci privatnya tidak pernah meninggalkan server.',
+ 'prefs.title':'Preferensi tampilan (browser ini)',
+ 'prefs.auto':'Segarkan otomatis','prefs.interval':'Interval penyegaran',
+ 'prefs.lang':'Bahasa','prefs.seconds':'{n} detik',
+ 'prefs.theme':'Tema','prefs.light':'Terang','prefs.dark':'Gelap',
+ 'prefs.note':'Aturan refresh dan bahasa tersimpan di browser ini, bukan konfigurasi server.',
+ 'set.persist':'Simpan juga ke .env',
+ 'set.persist.help':'Kalau dicentang, pilihan di sini tetap berlaku setelah server di-restart.',
+ 'set.save':'Simpan pengaturan','set.loading':'Memuat pengaturan…',
+ 'set.loadfail':'Gagal memuat pengaturan. Server tidak menjawab.',
+ 'set.saved':'Tersimpan. {n} pengaturan berlaku sekarang',
+ 'set.saved.env':', ditulis ke .env','set.saved.session':', hanya sesi ini',
+ 'set.restart':'. Perlu restart untuk: {list}',
+ 'set.savefail':'Gagal menyimpan. Server tidak menjawab.',
+ 'set.bind':'Pengaturan bind, tersimpan ke .env, berlaku setelah restart: ',
+ 'set.dashlogin.on':'Login dashboard: aktif untuk pengguna ',
+ 'set.dashlogin.off':'Login dashboard: belum aktif. Isi DASHBOARD_AUTH di .env lalu restart untuk mewajibkan login',
+ 'secret.set':'sudah tersimpan, kosongkan untuk mempertahankan',
+ 'secret.unset':'belum diisi',
+ 'toast.set.ok':'Pengaturan tersimpan dan berlaku sekarang.',
+ 'toast.set.fail':'Gagal menyimpan pengaturan. Server tidak menjawab.',
+ 'toast.recovered':'Koneksi ke server pulih. Data sudah live lagi.',
+ 'card.total':'Total request','card.errors':'Error (5xx)',
+ 'card.bytes':'Data terkirim','card.cachehit':'Cache hit',
+ 'card.cachemiss':'Cache miss','card.ratelimit':'Dibatasi (rate limit)',
+ 'card.blocked':'Diblokir','card.uptime':'Server menyala sejak',
+ 'dur.s':'dtk','dur.m':'mnt','dur.h':'jam','dur.d':'hari',
+ 'st.none':'belum ada','common.nodata':'belum ada data',
+ 'col.requests':'Request',
+ 'watch.none':'Tidak ada watchlist. Jalankan dengan <code>--lumi</code> atau <code>--watch HOST</code>.',
+ 'watch.req':'{n} request terpantau','watch.patterns':'Pola:',
+ 'watch.host':'Host terpantau',
+ 'detail.title':'Detail koneksi','d.id':'Nomor koneksi','d.time':'Waktu',
+ 'd.peer':'Klien','d.target':'Target / path','d.size':'Ukuran (sisi request)',
+ 'd.duration':'Durasi','d.watched':'Di watchlist','d.yes':'ya','d.no':'tidak',
+ 'flt.allstatus':'Semua status','flt.allmethod':'Semua metode',
+ 'd.up':'Naik (ke server)','d.down':'Turun (dari server)',
+ 'd.speed':'Kecepatan rata-rata',
+ 'pl.decoded':'dibuka dari {enc}, asli {size}',
+ 'pl.request_headers':'Header request',
+ 'pl.response_headers':'Header response',
+ 'pl.request':'Payload request','pl.response':'Payload response',
+ 'pl.request_decrypted':'Request terdekripsi (AES)',
+ 'pl.response_decrypted':'Response terdekripsi (AES)',
+ 'pl.request_lgeb':'Request terdekripsi (LGEB)',
+ 'pl.response_lgeb':'Response terdekripsi (LGEB)',
+ 'detail.full':'Lihat penuh','detail.trunc':', terpotong di tampilan',
+ 'detail.modaltrunc':'Tampilan dipotong pada batas ukuran capture yang diatur di Pengaturan.',
+ 'detail.connect':'Payload tidak ada: ini terowongan CONNECT (HTTPS), isinya terenkripsi ujung-ke-ujung antara HP dan server tujuan, proxy hanya meneruskan. Supaya terbaca, aktifkan MITM untuk host ini di Pengaturan dan pasang sertifikat CA di HP.',
+ 'detail.nopayload':'Payload tidak direkam untuk host ini. Nyalakan Rekam payload di Pengaturan dan masukkan host-nya ke daftar host yang direkam.',
+},
+en: {
+ 'nav.main':'Main menu','nav.config':'Configuration','nav.system':'System',
+ 'nav.dashboard':'Dashboard','nav.traffic':'Traffic','nav.held':'Held',
+ 'nav.settings':'Settings','nav.statsjson':'JSON statistics',
+ 'nav.health':'Server status','nav.ca':'CA certificate','nav.pac':'PAC file (phone)',
+ 'a11y.globalsearch':'Search hosts in traffic',
+ 'ph.globalsearch':'Search host, press Enter…','ph.q':'Search host / method / status…',
+ 'user.loginpage':'Login page','user.logout':'Sign out',
+ 'user.enablelogin':'Enable login','user.role.admin':'Administrator',
+ 'user.role.nologin':'No-login mode',
+ 'user.session.on':'Signed in, session active in this browser',
+ 'user.session.off':'Login not enabled (DASHBOARD_AUTH is empty)',
+ 'user.loading':'Loading session…',
+ 'alert.offline':'Cannot reach the server. Showing the last data that loaded successfully.',
+ 'btn.retry':'Retry',
+ 'view.dashboard':'Dashboard','view.traffic':'Traffic',
+ 'view.held':'Held (intercept)','view.https':'HTTPS (MITM)',
+ 'view.settings':'Settings',
+ 'quick.traffic.t':'View traffic','quick.traffic.d':'All connections and payload details.',
+ 'quick.held.t':'Review held traffic','quick.held.d':'Forward or drop intercepts.',
+ 'quick.https.t':'Configure HTTPS / MITM','quick.https.d':'The CA and hosts whose TLS is terminated.',
+ 'quick.settings.t':'Open settings','quick.settings.d':'Capture, intercept, PAC, and limits.',
+ 'chart.title':'Traffic chart','chart.requests':'Requests',
+ 'chart.bytes':'Data','chart.errors':'Errors',
+ 'chart.meta':'Total 60 min: {total} · Peak {peak}/min',
+ 'chart.empty':'No chart data yet.',
+ 'dash.recent':'Latest traffic','dash.alltraffic':'View all traffic',
+ 'dash.watch':'Watched hosts','dash.top':'Busiest hosts',
+ 'dash.pac':'Connect a phone (PAC)',
+ 'pac.label':'PAC URL for the phone Wi-Fi','pac.copy':'Copy PAC URL',
+ 'pac.help':'In the phone Wi-Fi settings choose the Auto proxy and paste this URL. Only hosts on the PAC list go through this proxy; the rest go direct.',
+ 'pac.manual':'Or use the Manual proxy: host = this proxy address, port = its port. Manual sends all phone traffic through here.',
+ 'pac.copied':'PAC URL copied. Paste it in the phone Wi-Fi settings.',
+ 'pac.copied.msg':'Copied. Paste it in the phone Wi-Fi settings.',
+ 'th.time':'Time','th.method':'Method','th.host':'Host','th.status':'Status',
+ 'th.size':'Size','th.duration':'Duration','th.note':'Note',
+ 'chip.all':'All','chip.watched':'Watched','chip.errors':'Errors only',
+ 'traffic.lede':'Payloads are shown only for your own hosts on the capture list; other connections show metadata only (host, status, size, duration). Click a row for details.',
+ 'page.per':'Rows per page','page.prev':'Previous','page.next':'Next',
+ 'page.info':'Page {a} of {b} · {n} connections',
+ 'recent.empty':'No traffic matches this filter yet. Point the phone at this proxy and open something, or loosen the filter.',
+ 'recent.none':'No traffic yet. Point the phone at this proxy and open something.',
+ 'note.watched':'watched','note.payload':'payload captured',
+ 'held.lede':'Requests and responses for hosts on the intercept list stop here first. <b>Forward</b> = send as usual. <b>Drop</b> = cut it off (requests rejected with 403, responses failed with 502). Past the timeout, held traffic is forwarded automatically.',
+ 'held.empty':'Nothing is being held. Intercept only holds hosts on the intercept host list in Settings.',
+ 'held.phase.request':'Request, from client to server (outgoing)',
+ 'held.phase.response':'Response, from server to client (incoming)',
+ 'held.release':'Forward','held.drop':'Drop',
+ 'held.edit':'Edit body','held.save':'Save changes',
+ 'held.edited':'edited',
+ 'held.edit.lgeb':'LGEB body: you are editing the decrypted text. Saving re-encrypts it automatically with the same key.',
+ 'held.edit.text':'Edit the body as text. The new content is forwarded when this item is released.',
+ 'held.saved':'Intercept #{id} body updated.',
+ 'held.editfail':'Failed to save intercept #{id} body.',
+ 'toast.held.release':'Intercept #{id} forwarded.',
+ 'toast.held.drop':'Intercept #{id} dropped.',
+ 'toast.held.fail':'Failed to process intercept #{id}. The server did not answer.',
+ 'modal.drop.title':'Drop this traffic?',
+ 'modal.drop.body':'A dropped request is cut off with 403, a dropped response is failed with 502. This cannot be undone.',
+ 'modal.drop.confirm':'Yes, drop','modal.cancel':'Cancel','modal.yes':'Yes',
+ 'modal.close':'Close','modal.back':'Back',
+ 'https.lede':'Without MITM, an HTTPS connection is only visible as a CONNECT tunnel: host and size, no contents. With MITM, the proxy terminates TLS for your own hosts with a local CA so the contents read like plain HTTP.',
+ 'mitm.loading':'Loading MITM status…','mitm.status':'Status',
+ 'mitm.on':'Active','mitm.off':'Off','mitm.ca.ready':'Ready',
+ 'mitm.ca.later':'Created the first time MITM is enabled',
+ 'mitm.ca.nocrypto':'Needs the cryptography package on the server',
+ 'mitm.hosts':'MITM hosts','mitm.none':'(none yet, set in Settings)',
+ 'mitm.verify':'Verify the real upstream certificate',
+ 'mitm.yes':'yes','mitm.no':'no (MITM_VERIFY_UPSTREAM=0)',
+ 'mitm.fp':'CA SHA-256 fingerprint, match it with what the phone shows when installing the certificate:',
+ 'mitm.download':'Download CA certificate (.crt)',
+ 'mitm.install':'Install on the phone, once:',
+ 'mitm.step1':'Download the CA file from the button above.',
+ 'mitm.step2':'<b>Android:</b> Settings, Security, Install certificate, CA certificate, pick the file.',
+ 'mitm.step3':'<b>iPhone:</b> open the file to install the profile, then Settings, General, About, Certificate Trust Settings, enable it for this CA.',
+ 'mitm.step4':'Turn MITM on in Settings and add your own server hosts. After that, HTTPS connections to those hosts appear as readable requests instead of blind CONNECT tunnels.',
+ 'mitm.pinning':'Apps that use certificate pinning will still reject this certificate; for your own apps, configure that on the app side. Only the public CA certificate is downloaded. Its private key never leaves the server.',
+ 'prefs.title':'Display preferences (this browser)',
+ 'prefs.auto':'Auto-refresh','prefs.interval':'Refresh interval',
+ 'prefs.lang':'Language','prefs.seconds':'{n} seconds',
+ 'prefs.theme':'Theme','prefs.light':'Light','prefs.dark':'Dark',
+ 'prefs.note':'Refresh rules and language are stored in this browser, not in the server configuration.',
+ 'set.persist':'Also save to .env',
+ 'set.persist.help':'When checked, choices here stay in effect after the server restarts.',
+ 'set.save':'Save settings','set.loading':'Loading settings…',
+ 'set.loadfail':'Failed to load settings. The server did not answer.',
+ 'set.saved':'Saved. {n} settings are now in effect',
+ 'set.saved.env':', written to .env','set.saved.session':', this session only',
+ 'set.restart':'. Restart required for: {list}',
+ 'set.savefail':'Failed to save. The server did not answer.',
+ 'set.bind':'Bind settings, saved to .env, apply after restart: ',
+ 'set.dashlogin.on':'Dashboard login: active for user ',
+ 'set.dashlogin.off':'Dashboard login: not active. Set DASHBOARD_AUTH in .env and restart to require login',
+ 'secret.set':'saved, leave blank to keep it',
+ 'secret.unset':'not set yet',
+ 'toast.set.ok':'Settings saved and now in effect.',
+ 'toast.set.fail':'Failed to save settings. The server did not answer.',
+ 'toast.recovered':'Connection to the server restored. Data is live again.',
+ 'card.total':'Total requests','card.errors':'Errors (5xx)',
+ 'card.bytes':'Data sent','card.cachehit':'Cache hits',
+ 'card.cachemiss':'Cache misses','card.ratelimit':'Rate limited',
+ 'card.blocked':'Blocked','card.uptime':'Uptime',
+ 'dur.s':'s','dur.m':'min','dur.h':'h','dur.d':'days',
+ 'st.none':'pending','common.nodata':'no data yet',
+ 'col.requests':'Requests',
+ 'watch.none':'No watchlist. Run with <code>--lumi</code> or <code>--watch HOST</code>.',
+ 'watch.req':'{n} watched requests','watch.patterns':'Patterns:',
+ 'watch.host':'Watched host',
+ 'detail.title':'Connection details','d.id':'Connection #','d.time':'Time',
+ 'd.peer':'Client','d.target':'Target / path','d.size':'Size (request side)',
+ 'd.duration':'Duration','d.watched':'Watched','d.yes':'yes','d.no':'no',
+ 'flt.allstatus':'All statuses','flt.allmethod':'All methods',
+ 'd.up':'Up (to server)','d.down':'Down (from server)',
+ 'd.speed':'Average speed',
+ 'pl.decoded':'decompressed from {enc}, original {size}',
+ 'pl.request_headers':'Request headers',
+ 'pl.response_headers':'Response headers',
+ 'pl.request':'Request payload','pl.response':'Response payload',
+ 'pl.request_decrypted':'Request (AES decrypted)',
+ 'pl.response_decrypted':'Response (AES decrypted)',
+ 'pl.request_lgeb':'Request (LGEB decrypted)',
+ 'pl.response_lgeb':'Response (LGEB decrypted)',
+ 'detail.full':'View full','detail.trunc':', truncated in view',
+ 'detail.modaltrunc':'The view is cut at the capture size limit set in Settings.',
+ 'detail.connect':'No payload: this is a CONNECT tunnel (HTTPS). Its contents are encrypted end to end between the phone and the destination server; the proxy only forwards them. To read it, enable MITM for this host in Settings and install the CA certificate on the phone.',
+ 'detail.nopayload':'No payload is recorded for this host. Turn on payload capture in Settings and add the host to the capture list.',
+}};
+window._lang = 'id';
+function t(k, params){
+  let v = (I18N[window._lang] || I18N.id)[k];
+  if (v == null) v = I18N.id[k] != null ? I18N.id[k] : k;
+  if (params) for (const p in params)
+    v = v.replace('{'+p+'}', String(params[p]));
+  return v;
+}
+const FG_EN = {
+ 'Capture payload: lihat isi lalu lintas host milikmu':'Payload capture: read traffic of your own hosts',
+ 'Intercept: tahan dulu, putuskan kemudian':'Intercept: hold first, decide later',
+ 'HTTPS (MITM): baca trafik terenkripsi host milikmu':'HTTPS (MITM): read encrypted traffic of your own hosts',
+ 'Umum':'General'};
+const FL_EN = {
+ 'PAYLOAD_CAPTURE':'Record payloads','PAYLOAD_ALLOW_HOSTS':'Hosts to record',
+ 'PAYLOAD_MAX_BYTES':'View size limit (bytes)','PAYLOAD_LGEB':'LGEB bundle reader',
+ 'PAYLOAD_LGEB_CONTENT_HASH':'LGEB content hash (optional)',
+ 'PAYLOAD_LGEB_SALT_HEX':'Server A LGEB salt','PAYLOAD_AES_KEY':'Payload AES key (optional)',
+ 'PAYLOAD_AES_IV':'Payload AES IV (optional)','INTERCEPT':'Enable intercept',
+ 'INTERCEPT_ALLOW_HOSTS':'Hosts to hold','INTERCEPT_TIMEOUT':'Hold timeout (seconds)',
+ 'MITM':'Enable MITM','MITM_ALLOW_HOSTS':'Hosts for MITM','PAC_HOSTS':'Hosts via proxy in the PAC file',
+ 'PROXY_PUBLIC_HOST':'Public address of this proxy','PROXY_CACHE_TTL':'GET response cache (seconds)',
+ 'PROXY_RATE_LIMIT':'Requests per minute per IP','PROXY_LOG_FORMAT':'Log format'};
+const FH_EN = {
+ 'PAYLOAD_CAPTURE':'Request/response bodies for hosts in the list below are shown in the connection details.',
+ 'PAYLOAD_ALLOW_HOSTS':'Comma separated. Wildcards allowed, e.g. api.example.com, *.example.com',
+ 'PAYLOAD_MAX_BYTES':'Larger payloads are cut in the view only, not in the traffic itself.',
+ 'PAYLOAD_LGEB':'Try to decrypt LGEB-format payloads (LGEB header + AES) using your server A salt.',
+ 'PAYLOAD_LGEB_CONTENT_HASH':'Leave empty to take the hash from the bundle file name.',
+ 'PAYLOAD_LGEB_SALT_HEX':'Secret. Leave blank to keep the stored value.',
+ 'PAYLOAD_AES_KEY':'For plain AES-128-CBC payloads. Secret, set-only.',
+ 'PAYLOAD_AES_IV':'Pairs with the key above. Secret, set-only.',
+ 'INTERCEPT':'Requests and responses for hosts in the list below are held until you forward or drop them in the Held panel.',
+ 'INTERCEPT_ALLOW_HOSTS':'Comma separated. Wildcards allowed.',
+ 'INTERCEPT_TIMEOUT':'After this, held traffic is forwarded automatically so your traffic never hangs.',
+ 'MITM':'The proxy terminates TLS for hosts in the list below with a local CA so HTTPS payloads read like HTTP. The phone must trust the CA. See the HTTPS panel.',
+ 'MITM_ALLOW_HOSTS':'Comma separated. Wildcards allowed. Your own hosts only.',
+ 'PAC_HOSTS':'Hosts the phone sends to this proxy; the rest go DIRECT.',
+ 'PROXY_PUBLIC_HOST':'Public domain/IP + port, used in the PAC file. E.g. 168.107.75.12:8089',
+ 'PROXY_CACHE_TTL':'0 = off. GET responses are kept briefly for repeated requests.',
+ 'PROXY_RATE_LIMIT':'0 = off.','PROXY_LOG_FORMAT':'text or json.'};
+function groupLabel(g){ return window._lang === 'en' && FG_EN[g] ? FG_EN[g] : g; }
+function fieldLabel(f){ return window._lang === 'en' && FL_EN[f.k] ? FL_EN[f.k] : f.label; }
+function fieldHelp(f){ return window._lang === 'en' && FH_EN[f.k] ? FH_EN[f.k] : f.help; }
+
+window._prefs = {auto:true, interval:2, lang:'id'};
+try {
+  Object.assign(window._prefs,
+    JSON.parse(localStorage.getItem('ps_prefs') || '{}'));
+} catch(e) {}
+window._lang = window._prefs.lang === 'en' ? 'en' : 'id';
+function savePrefs(){
+  try { localStorage.setItem('ps_prefs', JSON.stringify(window._prefs)); }
+  catch(e) {}
+}
+let _timer = null;
+function armTimer(){
+  if (_timer) clearInterval(_timer);
+  _timer = setInterval(()=>{
+    if (window._prefs.auto) tick();
+  }, (Number(window._prefs.interval) || 2) * 1000);
+}
+function applyLang(){
+  const L = I18N[window._lang] || I18N.id;
+  document.querySelectorAll('[data-i18n]').forEach(el=>{
+    const v = L[el.dataset.i18n]; if (v != null) el.textContent = v;
+  });
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{
+    const v = L[el.dataset.i18nHtml]; if (v != null) el.innerHTML = v;
+  });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el=>{
+    const v = L[el.dataset.i18nPh]; if (v != null) el.placeholder = v;
+  });
+  document.documentElement.lang = window._lang;
+  document.querySelectorAll('#prefInterval option').forEach(o=>{
+    o.textContent = t('prefs.seconds', {n:o.value});
+  });
+  applyRoute();
+  renderRecentHead();
+  if (window._cfg) loadSettings(); else renderMitm();
+  tick();
+}
+
+/* ================= formatting ================= */
+function dec(){ return window._lang === 'en' ? '.' : ','; }
 function fmtBytes(n){ n = Number(n)||0;
   if (n < 1024) return n + ' B';
-  if (n < 1048576) return (n/1024).toFixed(1).replace('.',',') + ' KB';
-  if (n < 1073741824) return (n/1048576).toFixed(1).replace('.',',') + ' MB';
-  return (n/1073741824).toFixed(2).replace('.',',') + ' GB'; }
+  if (n < 1048576) return (n/1024).toFixed(1).replace('.', dec()) + ' KB';
+  if (n < 1073741824) return (n/1048576).toFixed(1).replace('.', dec()) + ' MB';
+  return (n/1073741824).toFixed(2).replace('.', dec()) + ' GB'; }
 function fmtMs(ms){ ms = Number(ms)||0;
   if (ms < 1000) return ms + ' ms';
-  return (ms/1000).toFixed(1).replace('.',',') + ' dtk'; }
+  return (ms/1000).toFixed(1).replace('.', dec()) + ' ' + t('dur.s'); }
 function fmtUptime(s){ s = Number(s)||0;
-  if (s < 60) return s + ' dtk';
-  if (s < 3600) return Math.floor(s/60) + ' mnt';
-  if (s < 86400) return Math.floor(s/3600) + ' jam ' +
-    Math.floor((s%3600)/60) + ' mnt';
-  return Math.floor(s/86400) + ' hari'; }
+  if (s < 60) return s + ' ' + t('dur.s');
+  if (s < 3600) return Math.floor(s/60) + ' ' + t('dur.m');
+  if (s < 86400) return Math.floor(s/3600) + ' ' + t('dur.h') + ' ' +
+    Math.floor((s%3600)/60) + ' ' + t('dur.m');
+  return Math.floor(s/86400) + ' ' + t('dur.d'); }
 function statusPill(st){ st = Number(st)||0;
   const cls = st>=500 ? 'err' : st>=400 ? 'warn' : st>=300 ? 'info'
     : st>=200 ? 'ok' : '';
-  return `<span class="st ${cls}">${st===0 ? 'belum ada' : st}</span>`; }
+  return `<span class="st ${cls}">${st===0 ? t('st.none') : st}</span>`; }
+
+/* ================= traffic table: search, sort, paging ================= */
 window._recent = []; window._shown = []; window._filter = 'all';
+window._tstate = {key:'id', dir:-1, page:1};
+const SORTVAL = {
+  id: e=>e.id, time: e=>e.id, method: e=>String(e.method),
+  host: e=>String(e.host), status: e=>Number(e.status)||0,
+  bytes: e=>Number(e.bytes)||0, duration_ms: e=>Number(e.duration_ms)||0};
+const COLUMNS = [
+  {key:'time', label:'th.time', sort:true},
+  {key:'method', label:'th.method', sort:true},
+  {key:'host', label:'th.host', sort:true},
+  {key:'status', label:'th.status', sort:true},
+  {key:'bytes', label:'th.size', sort:true},
+  {key:'duration_ms', label:'th.duration', sort:true},
+  {key:'note', label:'th.note', sort:false}];
 
 function passesFilter(e){
   const f = window._filter;
@@ -2233,63 +2969,161 @@ function passesFilter(e){
   if (f === 'errors' && !(Number(e.status) >= 400)) return false;
   if (f === 'connect' && String(e.method).toUpperCase() !== 'CONNECT')
     return false;
+  const fs = ($('fStatus') || {}).value || '';
+  if (fs && Math.floor(Number(e.status) / 100) !== Number(fs))
+    return false;
+  const fm = ($('fMethod') || {}).value || '';
+  if (fm && String(e.method).toUpperCase() !== fm) return false;
   const q = ($('q').value || '').trim().toLowerCase();
   if (q){
-    const hay = (e.host + ' ' + e.method + ' ' + e.status + ' ' +
+    let hay = (e.host + ' ' + e.method + ' ' + e.status + ' ' +
       e.target).toLowerCase();
+    if (e.payload){
+      for (const k of PAYLOAD_KEYS){
+        const v = e.payload[k];
+        if (v && v.kind === 'text') hay += ' ' + v.preview.toLowerCase();
+      }
+    }
     if (!hay.includes(q)) return false;
   }
   return true;
 }
 
+function renderRecentHead(){
+  const thead = $('recent').querySelector('thead');
+  thead.innerHTML = '<tr>' + COLUMNS.map(c=>{
+    if (!c.sort) return `<th>${t(c.label)}</th>`;
+    const on = window._tstate.key === c.key;
+    const arrow = on ? (window._tstate.dir === 1 ? '↑' : '↓') : '';
+    return `<th class="sortable" data-k="${c.key}" tabindex="0">` +
+      `${t(c.label)}<span class="dir">${arrow}</span></th>`;
+  }).join('') + '</tr>';
+  thead.querySelectorAll('th.sortable').forEach(th=>{
+    const go = ()=>{
+      const k = th.dataset.k;
+      if (window._tstate.key === k) window._tstate.dir *= -1;
+      else {
+        window._tstate.key = k;
+        window._tstate.dir = (k === 'id' || k === 'time') ? -1 : 1;
+      }
+      window._tstate.page = 1;
+      renderRecentHead();
+      renderRecent();
+    };
+    th.addEventListener('click', go);
+    th.addEventListener('keydown', ev=>{
+      if (ev.key === 'Enter' || ev.key === ' '){
+        ev.preventDefault(); go(); }
+    });
+  });
+}
+
 function renderRecent(){
-  const list = window._recent.slice(0,50).filter(passesFilter);
+  let list = window._recent.filter(passesFilter);
+  const val = SORTVAL[window._tstate.key] || SORTVAL.id;
+  const dir = window._tstate.dir;
+  list.sort((a,b)=>{
+    const x = val(a), y = val(b);
+    return (x < y ? -1 : x > y ? 1 : 0) * dir;
+  });
   window._shown = list;
-  $('recent').querySelector('tbody').innerHTML = list.map((e,i)=>
-    `<tr data-i="${i}" tabindex="0">` +
+  const size = Number($('pageSize').value) || 25;
+  const pages = Math.max(1, Math.ceil(list.length / size));
+  if (window._tstate.page > pages) window._tstate.page = pages;
+  const page = window._tstate.page;
+  const slice = list.slice((page-1)*size, page*size);
+  $('recent').querySelector('tbody').innerHTML = slice.map(e=>
+    `<tr data-eid="${e.id}" tabindex="0">` +
     `<td class="mono">${esc(e.time)}</td><td>${esc(e.method)}</td>` +
     `<td class="mono ${e.watched?'watchname':''}">${esc(e.host)}</td>` +
     `<td>${statusPill(e.status)}</td><td class="mono">${fmtBytes(e.bytes)}</td>` +
     `<td class="mono">${fmtMs(e.duration_ms)}</td>` +
-    `<td>${[e.watched?'<span class="watchname">dipantau</span>':'',
-      e.payload?'<span class="muted">payload ada</span>':'']
+    `<td>${[e.watched?`<span class="watchname">${t('note.watched')}</span>`:'',
+      e.payload?`<span class="muted">${t('note.payload')}</span>`:'']
       .filter(Boolean).join(' · ')}</td></tr>`
   ).join('');
   $('recentEmpty').hidden = list.length > 0;
-  $('recent').querySelectorAll('tbody tr[data-i]').forEach(tr=>{
-    tr.addEventListener('click', ()=>showDetail(Number(tr.dataset.i)));
+  $('pageInfo').textContent =
+    t('page.info', {a:page, b:pages, n:list.length});
+  $('pagePrev').disabled = page <= 1;
+  $('pageNext').disabled = page >= pages;
+  $('recent').querySelectorAll('tbody tr[data-eid]').forEach(tr=>{
+    const open = ()=>{
+      const e = slice.find(x=>x.id === Number(tr.dataset.eid));
+      if (e) showDetail(e);
+    };
+    tr.addEventListener('click', open);
     tr.addEventListener('keydown', ev=>{
-      if (ev.key==='Enter' || ev.key===' '){
-        ev.preventDefault(); showDetail(Number(tr.dataset.i)); }});
+      if (ev.key === 'Enter' || ev.key === ' '){
+        ev.preventDefault(); open(); }
+    });
   });
   markSelectedRow();
 }
 
+function renderMini(){
+  const list = window._recent.slice(0,6);
+  const tb = $('recentMini').querySelector('tbody');
+  $('recentMini').querySelector('thead').innerHTML =
+    `<tr><th>${t('th.time')}</th><th>${t('th.method')}</th>` +
+    `<th>${t('th.host')}</th><th>${t('th.status')}</th>` +
+    `<th>${t('th.size')}</th></tr>`;
+  tb.innerHTML = list.length ? list.map(e=>
+    `<tr data-eid="${e.id}" tabindex="0">` +
+    `<td class="mono">${esc(e.time)}</td><td>${esc(e.method)}</td>` +
+    `<td class="mono ${e.watched?'watchname':''}">${esc(e.host)}</td>` +
+    `<td>${statusPill(e.status)}</td><td class="mono">${fmtBytes(e.bytes)}</td></tr>`
+  ).join('') : `<tr><td colspan="5" class="muted">${t('recent.none')}</td></tr>`;
+  tb.querySelectorAll('tr[data-eid]').forEach(tr=>{
+    const go = ()=>gotoDetail(Number(tr.dataset.eid));
+    tr.addEventListener('click', go);
+    tr.addEventListener('keydown', ev=>{
+      if (ev.key==='Enter' || ev.key===' '){ ev.preventDefault(); go(); }});
+  });
+  markSelectedRow();
+}
+
+function gotoDetail(id){
+  window._filter = 'all';
+  $('q').value = '';
+  document.querySelectorAll('.chip').forEach(x=>
+    x.classList.toggle('on', x.dataset.f === 'all'));
+  window._tstate = {key:'id', dir:-1, page:1};
+  if (location.hash !== '#/lalu-lintas') location.hash = '#/lalu-lintas';
+  applyRoute();
+  renderRecentHead();
+  renderRecent();
+  const e = window._recent.find(x=>x.id === id);
+  if (e) showDetail(e);
+}
+
+/* ================= data tick ================= */
 function renderIntercepts(pend){
   const badge = $('interceptBadge');
   badge.hidden = !pend.length;
   badge.textContent = pend.length;
   if (!pend.length){
     $('intercepts').innerHTML =
-      '<p class="muted">Tidak ada yang sedang ditahan. Intercept hanya ' +
-      'menahan host yang ada di daftar host intercept di Pengaturan.</p>';
+      `<p class="muted">${t('held.empty')}</p>`;
     return;
   }
   $('intercepts').innerHTML = pend.map(p=>{
     const phase = p.phase === 'request'
-      ? 'Request, dari klien ke server (keluar)'
-      : 'Response, dari server ke klien (masuk)';
+      ? t('held.phase.request') : t('held.phase.response');
     return `<div class="panel"><span class="phase">#${p.id} · ${esc(phase)}</span><br>` +
       `<span class="mono">${esc(p.method)} ${esc(p.host)}` +
       `${esc(p.target)}</span>` +
       (p.body ? `<pre>${esc(String(p.body.preview).slice(0,300))}</pre>` +
         `<span class="muted small">${esc(p.body.kind)} · ` +
         `${fmtBytes(p.body.size)}` +
-        `${p.body.truncated?' · terpotong di tampilan':''}</span>` : '') +
+        `${p.body.truncated ? t('detail.trunc') : ''}</span>` : '') +
+      (p.edited ? `<span class="muted small">${t('held.edited')}</span>` : '') +
       `<p><button type="button" class="primary" ` +
-      `onclick="resolveIntercept(${p.id},'release')">Teruskan</button> ` +
+      `onclick="resolveIntercept(${p.id},'release')">${t('held.release')}</button> ` +
+      (p.editable ? `<button type="button" ` +
+        `onclick="editIntercept(${p.id})">${t('held.edit')}</button> ` : '') +
       `<button type="button" class="danger" ` +
-      `onclick="resolveIntercept(${p.id},'drop')">Tolak</button></p></div>`;
+      `onclick="resolveIntercept(${p.id},'drop')">${t('held.drop')}</button></p></div>`;
   }).join('');
 }
 
@@ -2297,50 +3131,114 @@ async function tick(){
   try {
     const s = await (await fetch('/__stats')).json();
     $('errbar').hidden = true;
-    if (window._online === false)
-      toast('Koneksi ke server pulih. Data sudah live lagi.', 'ok');
+    if (window._online === false) toast(t('toast.recovered'), 'ok');
     window._online = true;
     $('cards').removeAttribute('aria-busy');
-    $('livePill').className = 'live ok';
-    $('liveText').textContent = 'Live, menyegarkan tiap 2 detik';
-    const c = [['Total request', s.requests], ['Error (5xx)', s.errors],
-      ['Data terkirim', fmtBytes(s.bytes_sent)],
-      ['Cache hit', s.cache_hits], ['Cache miss', s.cache_misses],
-      ['Dibatasi (rate limit)', s.rate_limited], ['Diblokir', s.blocked],
-      ['Server menyala sejak', fmtUptime(s.uptime_seconds)]];
+    const c = [[t('card.total'), s.requests], [t('card.errors'), s.errors],
+      [t('card.bytes'), fmtBytes(s.bytes_sent)],
+      [t('card.cachehit'), s.cache_hits], [t('card.cachemiss'), s.cache_misses],
+      [t('card.ratelimit'), s.rate_limited], [t('card.blocked'), s.blocked],
+      [t('card.uptime'), fmtUptime(s.uptime_seconds)]];
     $('cards').innerHTML = c.map(x=>
       `<div class="card"><b>${x[1]}</b><span>${x[0]}</span></div>`).join('');
     const w = s.watch || {};
     if ((w.patterns||[]).length){
       $('watch').innerHTML =
-        `<p><span class="watchname"><b>${w.total_requests} request ` +
-        `terpantau</b></span><br><span class="muted small">Pola: ` +
+        `<p><span class="watchname"><b>${t('watch.req', {n:w.total_requests})}</b></span><br>` +
+        `<span class="muted small">${t('watch.patterns')} ` +
         `${esc(w.patterns.join(', '))}</span></p>`;
       $('watchTable').innerHTML =
-        '<tr><th>Host terpantau</th><th>Request</th></tr>' +
+        `<tr><th>${t('watch.host')}</th><th>${t('col.requests')}</th></tr>` +
         (w.hosts||[]).map(h=>
           `<tr><td class="watchname">${esc(h[0])}</td>` +
           `<td>${h[1]}</td></tr>`).join('');
     }
     window._recent = s.recent || [];
+    window._lastStats = s;
+    renderChart(s);
     renderRecent();
     renderMini();
     const tops = s.top_hosts || [];
-    $('tops').innerHTML = '<tr><th>Host</th><th>Request</th></tr>' +
+    $('tops').innerHTML =
+      `<tr><th>${t('th.host')}</th><th>${t('col.requests')}</th></tr>` +
       (tops.length ? tops.map(h=>
         `<tr><td>${esc(h[0])}</td><td>${h[1]}</td></tr>`).join('')
-        : '<tr><td class="muted">belum ada data</td><td></td></tr>');
+        : `<tr><td class="muted">${t('common.nodata')}</td><td></td></tr>`);
   } catch(e) {
     $('errbar').hidden = false;
     window._online = false;
-    $('livePill').className = 'live warn';
-    $('liveText').textContent = 'Terputus, mencoba lagi otomatis';
   }
   try {
     const ij = await (await fetch('/__intercepts')).json();
     renderIntercepts(ij.pending || []);
   } catch(e) {}
 }
+
+/* ================= traffic chart ================= */
+window._chartMetric = 'requests';
+function renderChart(s){
+  const el = $('trafficChart');
+  const data = (s && s.series) || [];
+  const metric = window._chartMetric;
+  if (!data.length){
+    el.innerHTML = `<p class="muted">${t('chart.empty')}</p>`;
+    $('chartMeta').textContent = '';
+    return;
+  }
+  const vals = data.map(d=>Number(d[metric]) || 0);
+  const max = Math.max(...vals, 0);
+  const total = vals.reduce((a,b)=>a+b, 0);
+  const fmt = metric === 'bytes' ? fmtBytes : (v=>String(Math.round(v)));
+  $('chartMeta').textContent =
+    t('chart.meta', {total: fmt(total), peak: fmt(max)});
+  const W = 720, H = 180, PL = 46, PR = 8, PT = 10, PB = 22;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const top = max > 0 ? max : 1;
+  const X = i => PL + (data.length === 1 ? iw / 2
+    : i * iw / (data.length - 1));
+  const Y = v => PT + ih - (v / top) * ih;
+  let grid = '';
+  for (let g = 0; g <= 2; g++){
+    const v = top * g / 2, y = Y(v);
+    grid += `<line class="grid" x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}"/>` +
+      `<text x="${PL-6}" y="${y+3}" text-anchor="end">${esc(fmt(v))}</text>`;
+  }
+  let labels = '';
+  const step = Math.ceil(data.length / 5);
+  data.forEach((d,i)=>{
+    if (i % step === 0 || i === data.length - 1){
+      const dt = new Date(d.t * 1000);
+      const hh = String(dt.getHours()).padStart(2, '0') + ':' +
+        String(dt.getMinutes()).padStart(2, '0');
+      const anchor = i === 0 ? 'start'
+        : (i === data.length - 1 ? 'end' : 'middle');
+      labels += `<text x="${X(i)}" y="${H-6}" text-anchor="${anchor}">${hh}</text>`;
+    }
+  });
+  const pts = data.map((d,i)=>`${X(i).toFixed(1)},${Y(vals[i]).toFixed(1)}`);
+  const area = `<polygon class="area" points="${PL},${Y(0)} ` +
+    `${pts.join(' ')} ${X(data.length-1)},${Y(0)}"/>`;
+  const line = `<polyline class="line" points="${pts.join(' ')}"/>`;
+  let peakDot = '';
+  if (max > 0){
+    const pi = vals.indexOf(max);
+    peakDot = `<circle class="dot" cx="${X(pi)}" cy="${Y(max)}" r="3.5">` +
+      `<title>${esc(fmt(max))}</title></circle>`;
+  }
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" ` +
+    `aria-label="${esc(t('chart.title'))}">` +
+    `${grid}${area}${line}${peakDot}${labels}</svg>`;
+}
+document.querySelectorAll('[data-cm]').forEach(b=>
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('[data-cm]').forEach(x=>
+      x.classList.remove('on'));
+    b.classList.add('on');
+    window._chartMetric = b.dataset.cm;
+    renderChart(window._lastStats);
+  }));
+
+/* ================= settings ================= */
 const FIELDS = [
   {group:'Capture payload: lihat isi lalu lintas host milikmu'},
   {k:'PAYLOAD_CAPTURE', t:'bool', label:'Rekam payload',
@@ -2388,39 +3286,27 @@ window._cfg = null;
 function renderMitm(){
   const el = $('mitmPanel');
   const c = window._cfg;
-  if (!c){ el.innerHTML = '<p class="muted">Memuat status MITM…</p>'; return; }
+  if (!c){ el.innerHTML = `<p class="muted">${t('mitm.loading')}</p>`; return; }
   const ca = c.mitm_ca || {};
-  let h = `<p>Status: ${c.MITM
-    ? '<span class="st ok">Aktif</span>'
-    : '<span class="st warn">Mati</span>'} · CA: ${ca.ready
-    ? '<span class="st ok">Siap</span>'
+  let h = `<p>${t('mitm.status')}: ${c.MITM
+    ? `<span class="st ok">${t('mitm.on')}</span>`
+    : `<span class="st warn">${t('mitm.off')}</span>`} · CA: ${ca.ready
+    ? `<span class="st ok">${t('mitm.ca.ready')}</span>`
     : (ca.crypto_available
-      ? '<span class="st warn">Dibuat saat MITM pertama kali aktif</span>'
-      : '<span class="st err">Butuh paket cryptography di server</span>')}</p>`;
-  h += `<p class="muted small">Host yang di-MITM: <span class="mono">` +
-    `${esc(c.MITM_ALLOW_HOSTS || '(belum ada, isi di Pengaturan)')}</span>` +
-    ` · Verifikasi sertifikat asli server tujuan: ` +
-    `${ca.verify_upstream ? 'ya' : 'tidak (MITM_VERIFY_UPSTREAM=0)'}</p>`;
+      ? `<span class="st warn">${t('mitm.ca.later')}</span>`
+      : `<span class="st err">${t('mitm.ca.nocrypto')}</span>`)}</p>`;
+  h += `<p class="muted small">${t('mitm.hosts')}: <span class="mono">` +
+    `${esc(c.MITM_ALLOW_HOSTS || t('mitm.none'))}</span>` +
+    ` · ${t('mitm.verify')}: ` +
+    `${ca.verify_upstream ? t('mitm.yes') : t('mitm.no')}</p>`;
   if (ca.fingerprint)
-    h += `<p class="muted small">Fingerprint SHA-256 CA, samakan dengan ` +
-      `yang tampil di HP saat memasang sertifikat:<br>` +
+    h += `<p class="muted small">${t('mitm.fp')}<br>` +
       `<span class="mono">${esc(ca.fingerprint)}</span></p>`;
-  h += `<p><a class="btn primary" href="/__ca" download>Unduh sertifikat ` +
-    `CA (.crt)</a></p>`;
-  h += `<b>Pasang di HP, sekali saja:</b><ol class="steps">` +
-    `<li>Unduh file CA dari tombol di atas.</li>` +
-    `<li><b>Android:</b> Pengaturan → Keamanan → Pasang sertifikat → ` +
-    `Sertifikat CA → pilih file tadi.</li>` +
-    `<li><b>iPhone:</b> buka file-nya untuk memasang profil, lalu ` +
-    `Pengaturan → Umum → Tentang → Pengaturan Kepercayaan Sertifikat → ` +
-    `aktifkan untuk CA ini.</li>` +
-    `<li>Nyalakan MITM di Pengaturan dan isi host server milikmu. ` +
-    `Setelah itu, koneksi HTTPS ke host tersebut muncul sebagai request ` +
-    `yang terbaca, bukan lagi CONNECT buta.</li></ol>`;
-  h += `<p class="muted small">Aplikasi yang memakai certificate pinning ` +
-    `tetap menolak sertifikat ini; untuk aplikasi milikmu, atur dari sisi ` +
-    `aplikasinya. Yang diunduh hanya sertifikat publik CA. Kunci ` +
-    `privatnya tidak pernah meninggalkan server.</p>`;
+  h += `<p><a class="btn primary" href="/__ca" download>${t('mitm.download')}</a></p>`;
+  h += `<b>${t('mitm.install')}</b><ol class="steps">` +
+    `<li>${t('mitm.step1')}</li><li>${t('mitm.step2')}</li>` +
+    `<li>${t('mitm.step3')}</li><li>${t('mitm.step4')}</li></ol>`;
+  h += `<p class="muted small">${t('mitm.pinning')}</p>`;
   el.innerHTML = h;
 }
 
@@ -2432,47 +3318,46 @@ async function loadSettings(){
     for (const f of FIELDS){
       if (f.group){
         if (open) h += '</fieldset>';
-        h += `<fieldset><legend>${esc(f.group)}</legend>`;
+        h += `<fieldset><legend>${esc(groupLabel(f.group))}</legend>`;
         open = true;
         continue;
       }
       if (f.t === 'bool'){
         h += `<div class="field"><label class="check">` +
           `<input type="checkbox" id="cfg_${f.k}" ${c[f.k]?'checked':''}>` +
-          `<span>${esc(f.label)}<span class="help" style="display:block">` +
-          `${esc(f.help)}</span></span></label></div>`;
+          `<span>${esc(fieldLabel(f))}<span class="help" style="display:block">` +
+          `${esc(fieldHelp(f))}</span></span></label></div>`;
       } else if (f.t === 'secret'){
         const isSet = (c.secrets_set || {})[f.k];
         h += `<div class="field"><label for="cfg_${f.k}">` +
-          `${esc(f.label)}</label>` +
+          `${esc(fieldLabel(f))}</label>` +
           `<input type="password" id="cfg_${f.k}" autocomplete="off" ` +
-          `placeholder="${isSet ? 'sudah tersimpan, kosongkan untuk mempertahankan' : 'belum diisi'}">` +
-          `<div class="help">${esc(f.help)}</div></div>`;
+          `placeholder="${isSet ? t('secret.set') : t('secret.unset')}">` +
+          `<div class="help">${esc(fieldHelp(f))}</div></div>`;
       } else {
         h += `<div class="field"><label for="cfg_${f.k}">` +
-          `${esc(f.label)}</label>` +
+          `${esc(fieldLabel(f))}</label>` +
           `<input type="text" id="cfg_${f.k}" ` +
           `value="${esc(c[f.k] ?? '')}">` +
-          `<div class="help">${esc(f.help)}</div></div>`;
+          `<div class="help">${esc(fieldHelp(f))}</div></div>`;
       }
     }
     if (open) h += '</fieldset>';
     const r = c.restart_only || {};
-    h += `<p class="muted small">Pengaturan bind, tersimpan ke .env, ` +
-      `berlaku setelah restart: PROXY_HOST=${esc(r.PROXY_HOST)} · ` +
+    h += `<p class="muted small">${t('set.bind')}` +
+      `PROXY_HOST=${esc(r.PROXY_HOST)} · ` +
       `PROXY_PORT=${esc(r.PROXY_PORT)} · PROXY_MODE=${esc(r.PROXY_MODE)}` +
       (r.PROXY_UPSTREAM ? ` · PROXY_UPSTREAM=${esc(r.PROXY_UPSTREAM)}` : '') +
       `</p>`;
     const da = c.dashboard_auth || {};
-    h += `<p class="muted small">Login dashboard: ` +
+    h += `<p class="muted small">` +
       (da.enabled
-        ? `aktif untuk pengguna <b>${esc(da.user)}</b>`
-        : 'belum aktif. Isi DASHBOARD_AUTH di .env lalu restart ' +
-          'untuk mewajibkan login') + `.</p>`;
+        ? `${t('set.dashlogin.on')}<b>${esc(da.user)}</b>.`
+        : `${t('set.dashlogin.off')}.`) + `</p>`;
     $('settingsForm').innerHTML = h;
   } catch(e) {
     $('settingsForm').innerHTML =
-      '<p class="muted">Gagal memuat pengaturan. Server tidak menjawab.</p>';
+      `<p class="muted">${t('set.loadfail')}</p>`;
   }
   renderMitm();
 }
@@ -2491,19 +3376,20 @@ window.saveSettings = async function(){
   const msg = $('settingsMsg');
   try {
     const r = await (await fetch('/__config', {method:'POST', body})).json();
-    msg.textContent = 'Tersimpan. ' + (r.applied||[]).length +
-      ' pengaturan berlaku sekarang' +
-      (r.persisted ? ', ditulis ke .env' : ', hanya sesi ini') +
+    msg.textContent = t('set.saved', {n:(r.applied||[]).length}) +
+      (r.persisted ? t('set.saved.env') : t('set.saved.session')) +
       ((r.restart_required_for||[]).length
-        ? '. Perlu restart untuk: ' + r.restart_required_for.join(', ')
+        ? t('set.restart', {list:r.restart_required_for.join(', ')})
         : '') + '.';
-    toast('Pengaturan tersimpan dan berlaku sekarang.', 'ok');
+    toast(t('toast.set.ok'), 'ok');
   } catch(e) {
-    msg.textContent = 'Gagal menyimpan. Server tidak menjawab.';
-    toast('Gagal menyimpan pengaturan. Server tidak menjawab.', 'err');
+    msg.textContent = t('set.savefail');
+    toast(t('toast.set.fail'), 'err');
   }
   loadSettings();
 };
+
+/* ================= intercept actions ================= */
 window.resolveIntercept = async function(id, action){
   if (action === 'drop'){ confirmDrop(id); return; }
   await doResolveIntercept(id, action);
@@ -2511,39 +3397,69 @@ window.resolveIntercept = async function(id, action){
 async function doResolveIntercept(id, action){
   try {
     await fetch('/__intercept/' + action + '?id=' + id);
-    toast(action === 'release'
-      ? `Intercept #${id} diteruskan.`
-      : `Intercept #${id} ditolak.`, 'ok');
+    toast(t(action === 'release' ? 'toast.held.release' : 'toast.held.drop',
+      {id}), 'ok');
   } catch(e) {
-    toast(`Gagal memproses intercept #${id}. Server tidak menjawab.`,
-      'err');
+    toast(t('toast.held.fail', {id}), 'err');
   }
   tick();
 }
 function confirmDrop(id){
   window.openModal({
-    title: 'Tolak lalu lintas ini?',
-    bodyHtml: '<p>Request yang ditolak diputus dengan 403, response ' +
-      'yang ditolak digagalkan dengan 502. Tindakan ini tidak bisa ' +
-      'dibatalkan.</p>',
-    confirmText: 'Ya, tolak', cancelText: 'Batal', danger: true,
+    title: t('modal.drop.title'),
+    bodyHtml: `<p>${t('modal.drop.body')}</p>`,
+    confirmText: t('modal.drop.confirm'), cancelText: t('modal.cancel'),
+    danger: true,
     onConfirm: ()=>doResolveIntercept(id, 'drop')});
 }
 
-/* ----- toast + modal ----- */
+window.editIntercept = async function(id){
+  let info;
+  try {
+    info = await (await fetch('/__intercept/body?id=' + id)).json();
+  } catch(e) { info = null; }
+  if (!info || !info.ok){
+    toast(t('held.editfail', {id}), 'err');
+    return;
+  }
+  const note = info.edit_mode === 'lgeb'
+    ? t('held.edit.lgeb') : t('held.edit.text');
+  window.openModal({
+    title: t('held.edit') + ' #' + id,
+    bodyHtml: `<p class="muted small">${note}</p>` +
+      `<textarea id="editBody" rows="12" spellcheck="false">` +
+      `${esc(info.edit_text || '')}</textarea>`,
+    confirmText: t('held.save'), cancelText: t('modal.cancel'),
+    onConfirm: async ()=>{
+      const text = ($('editBody') || {}).value || '';
+      try {
+        const r = await (await fetch('/__intercept/edit?id=' + id,
+          {method: 'POST',
+           headers: {'Content-Type': 'application/json'},
+           body: JSON.stringify({text})})).json();
+        if (r.ok) toast(t('held.saved', {id}), 'ok');
+        else toast(t('held.editfail', {id}), 'err');
+      } catch(e) {
+        toast(t('held.editfail', {id}), 'err');
+      }
+      tick();
+    }});
+};
+
+/* ================= toast + modal ================= */
 window.toast = function(msg, type){
   type = type || 'ok';
-  const t = document.createElement('div');
-  t.className = 'toast ' + type;
-  if (type === 'err') t.setAttribute('role', 'alert');
-  t.innerHTML = `<span>${esc(msg)}</span>` +
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  if (type === 'err') el.setAttribute('role', 'alert');
+  el.innerHTML = `<span>${esc(msg)}</span>` +
     `<button type="button" class="iconbtn" aria-label="Tutup notifikasi">` +
     `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" ` +
     `stroke="currentColor" stroke-width="2" aria-hidden="true">` +
     `<path d="M6 6l12 12M18 6L6 18"/></svg></button>`;
-  t.querySelector('button').addEventListener('click', ()=>t.remove());
-  $('toastStack').appendChild(t);
-  if (type !== 'err') setTimeout(()=>t.remove(), 4200);
+  el.querySelector('button').addEventListener('click', ()=>el.remove());
+  $('toastStack').appendChild(el);
+  if (type !== 'err') setTimeout(()=>el.remove(), 4200);
 };
 
 window.openModal = function(opts){
@@ -2552,8 +3468,8 @@ window.openModal = function(opts){
   const confirmBtn = $('modalConfirm'), cancelBtn = $('modalCancel');
   $('modalTitle').textContent = opts.title || '';
   $('modalBody').innerHTML = opts.bodyHtml || '';
-  confirmBtn.textContent = opts.confirmText || 'Ya';
-  cancelBtn.textContent = opts.cancelText || 'Batal';
+  confirmBtn.textContent = opts.confirmText || t('modal.yes');
+  cancelBtn.textContent = opts.cancelText || t('modal.cancel');
   confirmBtn.className = opts.danger ? 'danger-btn' : 'primary';
   backdrop.hidden = false;
   const close = result => {
@@ -2583,27 +3499,25 @@ window.openModal = function(opts){
 window.openPayloadModal = function(key){
   const v = (window._fullPayload || {})[key]; if (!v) return;
   window.openModal({
-    title: (PAYLOAD_NAMES[key] || key) + ' · ' + fmtBytes(v.size),
+    title: t('pl.' + key) + ' · ' + fmtBytes(v.size),
     bodyHtml: `<pre>${esc(v.preview)}</pre>` +
       (v.truncated
-        ? '<p class="muted small">Tampilan dipotong pada batas ukuran ' +
-          'capture yang diatur di Pengaturan.</p>' : ''),
-    confirmText: 'Tutup', cancelText: 'Kembali'});
+        ? `<p class="muted small">${t('detail.modaltrunc')}</p>` : ''),
+    confirmText: t('modal.close'), cancelText: t('modal.back')});
 };
 
+/* ================= detail drawer ================= */
 window._detailId = null;
 window._fullPayload = {};
-const PAYLOAD_NAMES = {request:'Payload request',
-  response:'Payload response',
-  request_decrypted:'Request terdekripsi (AES)',
-  response_decrypted:'Response terdekripsi (AES)',
-  request_lgeb:'Request terdekripsi (LGEB)',
-  response_lgeb:'Response terdekripsi (LGEB)'};
+const PAYLOAD_KEYS = ['request', 'response', 'request_decrypted',
+  'response_decrypted', 'request_lgeb', 'response_lgeb'];
 
 function markSelectedRow(){
-  document.querySelectorAll('#recent tbody tr[data-i]').forEach(tr=>{
-    const e = (window._shown||[])[Number(tr.dataset.i)];
-    tr.classList.toggle('selected', !!e && e.id === window._detailId);
+  document.querySelectorAll(
+    '#recent tbody tr[data-eid], #recentMini tbody tr[data-eid]'
+  ).forEach(tr=>{
+    tr.classList.toggle('selected',
+      Number(tr.dataset.eid) === window._detailId);
   });
 }
 
@@ -2626,40 +3540,48 @@ window.closeDetail = function(){
     250);
 };
 
-window.showDetail = function(i){
-  const e = (window._shown||[])[i]; if(!e) return;
+const DETAIL_KEYS = ['request_headers', 'request', 'response_headers',
+  'response', 'request_decrypted', 'response_decrypted',
+  'request_lgeb', 'response_lgeb'];
+
+window.showDetail = function(e){
+  if (!e) return;
   window._detailId = e.id;
   window._fullPayload = {};
-  const rows = [['Nomor koneksi', '#' + e.id], ['Waktu', e.time],
-    ['Klien', e.peer], ['Method', e.method], ['Host', e.host],
-    ['Target / path', e.target], ['Status', e.status],
-    ['Ukuran (sisi request)', fmtBytes(e.bytes)],
-    ['Durasi', fmtMs(e.duration_ms)],
-    ['Di watchlist', e.watched ? 'ya' : 'tidak']];
+  const secs = (Number(e.duration_ms) || 0) / 1000;
+  const speed = secs > 0
+    ? fmtBytes(Math.round((Number(e.bytes) || 0) / secs)) + '/s' : '—';
+  const rows = [[t('d.id'), '#' + e.id], [t('d.time'), e.time],
+    [t('d.peer'), e.peer], ['Method', e.method], ['Host', e.host],
+    [t('d.target'), e.target], ['Status', e.status],
+    [t('d.size'), fmtBytes(e.bytes)],
+    [t('d.up'), fmtBytes(e.bytes_up || 0)],
+    [t('d.down'), fmtBytes(e.bytes_down || 0)],
+    [t('d.duration'), fmtMs(e.duration_ms)],
+    [t('d.speed'), speed],
+    [t('d.watched'), e.watched ? t('d.yes') : t('d.no')]];
   let h = `<table>` + rows.map(r=>
       `<tr><td class="muted">${r[0]}</td>` +
       `<td>${esc(r[1])}</td></tr>`).join('') + `</table>`;
   if (e.payload){
-    for (const k of Object.keys(PAYLOAD_NAMES)){
+    for (const k of DETAIL_KEYS){
       const v = e.payload[k];
       if (!v) continue;
       window._fullPayload[k] = v;
+      const decNote = v.encoding
+        ? ', ' + t('pl.decoded',
+            {enc: v.encoding, size: fmtBytes(v.raw_size || 0)}) : '';
       h += `<h3 class="small" style="margin:14px 0 2px">` +
-        `${PAYLOAD_NAMES[k]} <span class="muted">(${esc(v.kind)}, ` +
-        `${fmtBytes(v.size)}${v.truncated?', terpotong di tampilan':''})` +
-        `</span></h3><pre>${esc(v.preview)}</pre>` +
+        `${t('pl.' + k)} <span class="muted">(${esc(v.kind)}, ` +
+        `${fmtBytes(v.size)}${v.truncated ? t('detail.trunc') : ''}` +
+        `${decNote})</span></h3><pre>${esc(v.preview)}</pre>` +
         `<p><button type="button" ` +
-        `onclick="openPayloadModal('${k}')">Lihat penuh</button></p>`;
+        `onclick="openPayloadModal('${k}')">${t('detail.full')}</button></p>`;
     }
   } else if (String(e.method).toUpperCase() === 'CONNECT'){
-    h += `<p class="muted">Payload tidak ada: ini terowongan CONNECT ` +
-      `(HTTPS), isinya terenkripsi ujung-ke-ujung antara HP dan server ` +
-      `tujuan, proxy hanya meneruskan. Supaya terbaca, aktifkan MITM ` +
-      `untuk host ini di Pengaturan dan pasang sertifikat CA di HP.</p>`;
+    h += `<p class="muted">${t('detail.connect')}</p>`;
   } else {
-    h += `<p class="muted">Payload tidak direkam untuk host ini. ` +
-      `Nyalakan "Rekam payload" di Pengaturan dan masukkan host-nya ke ` +
-      `daftar host yang direkam.</p>`;
+    h += `<p class="muted">${t('detail.nopayload')}</p>`;
   }
   $('detailBody').innerHTML = h;
   $('detailId').textContent = '#' + e.id;
@@ -2668,47 +3590,11 @@ window.showDetail = function(i){
   markSelectedRow();
 };
 
-function renderMini(){
-  const list = window._recent.slice(0,6);
-  const tb = $('recentMini').querySelector('tbody');
-  tb.innerHTML = list.length ? list.map(e=>
-    `<tr data-id="${e.id}" tabindex="0">` +
-    `<td class="mono">${esc(e.time)}</td><td>${esc(e.method)}</td>` +
-    `<td class="mono ${e.watched?'watchname':''}">${esc(e.host)}</td>` +
-    `<td>${statusPill(e.status)}</td><td class="mono">${fmtBytes(e.bytes)}</td></tr>`
-  ).join('') : '<tr><td colspan="5" class="muted">Belum ada lalu lintas. ' +
-    'Arahkan HP ke proxy ini lalu buka sesuatu.</td></tr>';
-  tb.querySelectorAll('tr[data-id]').forEach(tr=>{
-    const go = ()=>gotoDetail(Number(tr.dataset.id));
-    tr.addEventListener('click', go);
-    tr.addEventListener('keydown', ev=>{
-      if (ev.key==='Enter' || ev.key===' '){ ev.preventDefault(); go(); }});
-  });
-}
-
-function gotoDetail(id){
-  window._filter = 'all';
-  $('q').value = '';
-  document.querySelectorAll('.chip').forEach(x=>
-    x.classList.toggle('on', x.dataset.f === 'all'));
-  if (location.hash !== '#/lalu-lintas') location.hash = '#/lalu-lintas';
-  applyRoute();
-  renderRecent();
-  const idx = window._shown.findIndex(e=>e.id === id);
-  if (idx >= 0) showDetail(idx);
-}
-
+/* ================= routing ================= */
 const VIEWS = {
-  'ringkasan': ['Dashboard', 'Keadaan proxy saat ini, sekilas.'],
-  'lalu-lintas': ['Lalu lintas',
-    'Semua koneksi yang lewat proxy ini. Klik baris untuk detailnya.'],
-  'ditahan': ['Ditahan (intercept)',
-    'Lalu lintas yang berhenti dulu menunggu keputusanmu.'],
-  'https': ['HTTPS (MITM)',
-    'Baca trafik terenkripsi untuk host milikmu.'],
-  'pengaturan': ['Pengaturan',
-    'Berlaku langsung; simpan ke .env agar tetap ada setelah restart.'],
-};
+  'ringkasan': 'view.dashboard', 'lalu-lintas': 'view.traffic',
+  'ditahan': 'view.held', 'https': 'view.https',
+  'pengaturan': 'view.settings'};
 function applyRoute(){
   let v = (location.hash || '').replace('#/', '');
   if (!VIEWS[v]) v = 'ringkasan';
@@ -2720,31 +3606,82 @@ function applyRoute(){
     if (on) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   });
-  $('viewTitle').textContent = VIEWS[v][0];
-  $('viewSub').textContent = VIEWS[v][1];
-  $('crumbView').textContent = VIEWS[v][0];
+  $('viewTitle').textContent = t(VIEWS[v]);
+  $('crumbView').textContent = t(VIEWS[v]);
 }
 window.addEventListener('hashchange', applyRoute);
 
-document.querySelectorAll('.chip').forEach(ch=>
+/* ================= wiring ================= */
+document.querySelectorAll('.chip[data-f]').forEach(ch=>
   ch.addEventListener('click', ()=>{
-    document.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));
+    document.querySelectorAll('.chip[data-f]').forEach(x=>
+      x.classList.remove('on'));
     ch.classList.add('on');
     window._filter = ch.dataset.f;
+    window._tstate.page = 1;
     renderRecent();
   }));
-$('q').addEventListener('input', renderRecent);
-$('btnRefresh').addEventListener('click', tick);
+for (const fid of ['fStatus', 'fMethod']){
+  $(fid).addEventListener('change', ()=>{
+    window._tstate.page = 1;
+    renderRecent();
+  });
+}
+$('q').addEventListener('input', ()=>{
+  window._tstate.page = 1;
+  renderRecent();
+});
+$('pageSize').addEventListener('change', ()=>{
+  window._tstate.page = 1;
+  renderRecent();
+});
+$('pagePrev').addEventListener('click', ()=>{
+  if (window._tstate.page > 1){ window._tstate.page--; renderRecent(); }
+});
+$('pageNext').addEventListener('click', ()=>{
+  window._tstate.page++;
+  renderRecent();
+});
 $('btnSave').addEventListener('click', ()=>window.saveSettings());
 $('pacUrl').value = location.origin + '/proxy.pac';
 $('btnCopyPac').addEventListener('click', async ()=>{
   try { await navigator.clipboard.writeText($('pacUrl').value); }
   catch(e){ $('pacUrl').select(); document.execCommand('copy'); }
-  $('pacMsg').textContent = 'Tersalin. Tempel di pengaturan Wi-Fi HP.';
-  toast('URL PAC tersalin. Tempel di pengaturan Wi-Fi HP.', 'ok');
+  $('pacMsg').textContent = t('pac.copied.msg');
+  toast(t('pac.copied'), 'ok');
 });
 document.addEventListener('keydown', ev=>{
   if (ev.key === 'Escape' && window.closeDetail) window.closeDetail();
+});
+
+/* ----- preferences: refresh rules, language, theme ----- */
+function applyTheme(){
+  document.documentElement.dataset.theme =
+    window._prefs.theme === 'dark' ? 'dark' : 'light';
+}
+$('prefAutoRefresh').checked = !!window._prefs.auto;
+$('prefInterval').value = String(window._prefs.interval || 2);
+$('prefLang').value = window._lang;
+$('prefTheme').value = window._prefs.theme === 'dark' ? 'dark' : 'light';
+$('prefAutoRefresh').addEventListener('change', ev=>{
+  window._prefs.auto = ev.target.checked;
+  savePrefs();
+});
+$('prefInterval').addEventListener('change', ev=>{
+  window._prefs.interval = Number(ev.target.value) || 2;
+  savePrefs();
+  armTimer();
+});
+$('prefLang').addEventListener('change', ev=>{
+  window._prefs.lang = ev.target.value;
+  window._lang = window._prefs.lang === 'en' ? 'en' : 'id';
+  savePrefs();
+  applyLang();
+});
+$('prefTheme').addEventListener('change', ev=>{
+  window._prefs.theme = ev.target.value;
+  savePrefs();
+  applyTheme();
 });
 
 /* ----- admin shell: sidebar, user menu, session ----- */
@@ -2799,19 +3736,15 @@ async function loadSession(){
     const s = await (await fetch('/__session')).json();
     window._session = s;
     const name = s.user || 'Operator';
-    const role = s.auth_enabled ? 'Administrator' : 'Mode tanpa login';
     $('userNameLabel').textContent = name;
     $('ddUserName').textContent = name;
-    $('sidebarUserName').textContent = name;
-    $('userRoleLabel').textContent = role;
-    $('sidebarUserRole').textContent = role;
+    $('userRoleLabel').textContent =
+      t(s.auth_enabled ? 'user.role.admin' : 'user.role.nologin');
     $('userAvatar').textContent = initials(name);
-    $('sidebarAvatar').textContent = initials(name);
-    $('sessionState').textContent = s.auth_enabled
-      ? 'Login aktif, sesi berlaku di browser ini'
-      : 'Login belum diaktifkan (DASHBOARD_AUTH kosong)';
-    $('logoutBtn').textContent = s.auth_enabled ? 'Keluar'
-      : 'Aktifkan login';
+    $('sessionState').textContent =
+      t(s.auth_enabled ? 'user.session.on' : 'user.session.off');
+    $('logoutBtn').textContent =
+      t(s.auth_enabled ? 'user.logout' : 'user.enablelogin');
   } catch(e) {}
 }
 async function doLogout(){
@@ -2820,7 +3753,6 @@ async function doLogout(){
   location.href = '/__login';
 }
 $('logoutBtn').addEventListener('click', doLogout);
-$('sidebarLogoutBtn').addEventListener('click', doLogout);
 $('globalSearch').addEventListener('keydown', ev=>{
   if (ev.key !== 'Enter') return;
   ev.preventDefault();
@@ -2828,16 +3760,19 @@ $('globalSearch').addEventListener('keydown', ev=>{
   document.querySelectorAll('.chip').forEach(x=>
     x.classList.toggle('on', x.dataset.f === 'all'));
   $('q').value = ev.target.value;
+  window._tstate.page = 1;
   if (location.hash !== '#/lalu-lintas') location.hash = '#/lalu-lintas';
   applyRoute();
   renderRecent();
 });
 
-setInterval(()=>{ if ($('autoRefresh').checked) tick(); }, 2000);
-applyRoute();
+/* ----- init ----- */
+applyTheme();
+applyLang();
 loadSettings();
 loadSession();
-tick();
+armTimer();
+
 </script></body></html>
 """
 
